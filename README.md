@@ -9,20 +9,32 @@ Hot symbols live in RAM inside a lock-free ring buffer. Cold symbols spill to Pa
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                      CandleStore                        │
-│                                                         │
-│  "BTCUSDT:1m" ──► RingBuffer[Candle]  ◄── L3-tuned      │
-│  "ETHUSDT:1m" ──► RingBuffer[Candle]      capacity      │
-│  "SOLUSDT:1m" ──► RingBuffer[Candle]                    │
-│        ...                                              │
-│  LRU eviction ──► {data_dir}/symbol/*.parquet           │
-│  Cache miss   ──► read Parquet + merge with hot         │
-└─────────────────────────────────────────────────────────┘
-         ▲                        ▲
-  Binance WebSocket          Go / C FFI
-  (--features feed)        (cgo wrapper)
+  ┌─────────────── feed handler process ────────────────┐
+  │  Binance WebSocket  ──►  ShmRingWriter              │
+  │  (--features feed)       77 ns/msg, zero-copy       │
+  └──────────────────────────────┬──────────────────────┘
+                                 │  POSIX shm_open/mmap
+                  ┌──────────────▼──────────────────────┐
+                  │   ShmIngester (background thread)    │
+                  │   ShmRingReader.try_pop()            │
+                  │         │                            │
+                  │         ▼                            │
+                  │  ┌─────────────────────────────────┐ │
+                  │  │         CandleStore             │ │
+                  │  │                                 │ │
+                  │  │ "BTCUSDT:1m" ─► RingBuffer      │ │
+                  │  │ "ETHUSDT:1m" ─► RingBuffer      │ │  ◄── Go / C FFI
+                  │  │ "SOLUSDT:1m" ─► RingBuffer      │ │      (cgo wrapper)
+                  │  │   ...       (L3-tuned cap)      │ │
+                  │  │                                 │ │
+                  │  │  LRU evict ─► *.parquet         │ │
+                  │  │  cold miss ◄─ read + merge      │ │
+                  │  └─────────────────────────────────┘ │
+                  └──────────────────────────────────────┘
 ```
+
+**IPC path**: feed handler → SHM ring → ShmIngester → CandleStore → strategy queries.
+No TCP, no syscall on the hot path. Per-message latency: **77 ns** (SPSC atomic ops only).
 
 ---
 
@@ -98,6 +110,35 @@ store.append("BTCUSDT:1m", Candle {
 let candles = store.range("BTCUSDT:1m", from_ts, to_ts);
 ```
 
+### Cross-process SHM pipeline
+
+Feed handler process and strategy process communicate via shared memory:
+
+```rust
+// ── feed handler process ──────────────────────────────────────────────────────
+use candlestore::ShmRingWriter;
+
+let writer = ShmRingWriter::create("/my_feed", 65536)?;
+loop {
+    let candle = fetch_from_exchange();
+    writer.push(candle);  // 77 ns, no kernel, no copy
+}
+
+// ── strategy process ──────────────────────────────────────────────────────────
+use std::sync::Arc;
+use candlestore::{CandleStore, ShmRingReader, ShmIngester};
+
+let store    = Arc::new(CandleStore::from_hardware(10));
+let reader   = ShmRingReader::open("/my_feed", 65536)?;
+let _ingest  = ShmIngester::start(reader, Arc::clone(&store), "BTCUSDT:1m");
+// background thread now drains the ring into the store continuously
+
+let candles = store.range("BTCUSDT:1m", from_ts, to_ts);
+```
+
+See `examples/shm_pipeline.rs` for a full single-process demo, and
+`examples/shm_writer.rs` / `examples/shm_reader.rs` for the cross-process version.
+
 ### Go (via cgo)
 
 ```go
@@ -158,6 +199,8 @@ src/
   parquet.rs      Cold spill to Parquet, range-aware file naming
   hw.rs           Hardware detection (L3, cache line, cores)
   ffi.rs          C ABI for Go/cgo
+  shm.rs          SPSC ring buffers: heap (SpscRing) + POSIX shm (ShmRing*)
+                  ShmIngester — background thread, drains SHM ring into store
   matching/       Order book + paper trading engine
     book.rs       Price-time priority (Limit/Market/IOC/FOK)
     paper.rs      Candle-based paper trading simulation
@@ -165,9 +208,13 @@ src/
 
 go-client/        Go wrapper + SMA crossover example
 examples/
-  binance_feed.rs Live BTC/ETH/SOL feed (requires --features feed)
-  paper_trade.rs  SMA(10/20) crossover strategy
-  hw_probe.rs     Print detected hardware profile
+  binance_feed.rs    Live BTC/ETH/SOL feed (requires --features feed)
+  paper_trade.rs     SMA(10/20) crossover strategy
+  hw_probe.rs        Print detected hardware profile
+  shm_pipeline.rs    Full pipeline demo: SHM ring → ShmIngester → CandleStore → query
+  shm_writer.rs      Cross-process SHM writer (5M candles, prints throughput)
+  shm_reader.rs      Cross-process SHM reader (reports min/avg/max/p99 latency)
+  cache_ladder.rs    Drepper pointer-chase: measure true L1/L2/L3/DRAM latency
 include/
-  candlestore.h   C header for FFI consumers
+  candlestore.h      C header for FFI consumers
 ```

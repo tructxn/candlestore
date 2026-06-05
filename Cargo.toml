@@ -69,3 +69,6 @@ name = "shm_writer"
 
 [[example]]
 name = "shm_reader"
+
+[[example]]
+name = "shm_pipeline"

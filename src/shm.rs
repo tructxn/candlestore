@@ -21,7 +21,7 @@
 //! This is sufficient because there is exactly one producer and one consumer.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::Candle;
 
@@ -537,11 +537,78 @@ mod shm_impl {
             unsafe { munmap(self.ptr as *mut libc::c_void, self.map_size) };
         }
     }
+
+    // ── ShmIngester ──────────────────────────────────────────────────────────
+
+    /// Background thread that continuously drains a [`ShmRingReader`] into a
+    /// [`CandleStore`] by calling `store.append(symbol, candle)` on every pop.
+    ///
+    /// The thread spins on `try_pop`. Dropping the ingester (or calling
+    /// [`stop`](ShmIngester::stop)) signals the thread to exit and joins it.
+    ///
+    /// # Usage
+    ///
+    /// ```rust,ignore
+    /// use std::sync::Arc;
+    /// use candlestore::{CandleStore, ShmRingWriter, ShmRingReader, ShmIngester};
+    ///
+    /// let store  = Arc::new(CandleStore::from_hardware(10));
+    /// let writer = ShmRingWriter::create("/my_feed", 65536).unwrap();
+    /// let reader = ShmRingReader::open("/my_feed", 65536).unwrap();
+    /// let _ingest = ShmIngester::start(reader, Arc::clone(&store), "BTCUSDT:1m");
+    ///
+    /// // writer.push(candle) in another thread / process
+    /// ```
+    pub struct ShmIngester {
+        running: Arc<AtomicBool>,
+        handle:  Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ShmIngester {
+        /// Spawn the ingester thread.
+        ///
+        /// The thread owns `reader` and `store`. It pops candles and calls
+        /// `store.append(symbol, candle)` until [`stop`](Self::stop) is called.
+        pub fn start(
+            reader: ShmRingReader,
+            store:  Arc<crate::store::CandleStore>,
+            symbol: impl Into<String>,
+        ) -> Self {
+            let running  = Arc::new(AtomicBool::new(true));
+            let running2 = Arc::clone(&running);
+            let symbol   = symbol.into();
+
+            let handle = std::thread::spawn(move || {
+                while running2.load(Ordering::Relaxed) {
+                    match reader.try_pop() {
+                        Some(candle) => store.append(&symbol, candle),
+                        None         => std::hint::spin_loop(),
+                    }
+                }
+            });
+
+            Self { running, handle: Some(handle) }
+        }
+
+        /// Signal the ingester thread to stop and wait for it to exit.
+        pub fn stop(&mut self) {
+            self.running.store(false, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    impl Drop for ShmIngester {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
 }
 
 // Re-export platform types at module level.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub use shm_impl::{ShmRingReader, ShmRingWriter};
+pub use shm_impl::{ShmRingReader, ShmRingWriter, ShmIngester};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests

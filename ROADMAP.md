@@ -89,6 +89,23 @@ Hot data in RAM, cold data spilled to Parquet. No server, no GC, no SQL overhead
 
 ---
 
+## Phase 8 — SHM Ingestion Pipeline ✅
+> Connect the SPSC shared-memory ring to the CandleStore, completing the
+> feed handler → store → strategy data path.
+
+- [x] `ShmIngester` — background thread that spins on `ShmRingReader::try_pop()`,
+      calling `store.append(symbol, candle)` on every message
+- [x] `ShmIngester::start(reader, Arc<CandleStore>, symbol)` — non-blocking factory;
+      thread runs until `stop()` or `Drop`
+- [x] `ShmIngester::stop()` — signals thread via `AtomicBool`, joins before returning
+- [x] `examples/shm_pipeline.rs` — end-to-end demo: feed thread → SHM ring →
+      ShmIngester → CandleStore → `range()` query; asserts all 50k candles land
+- [x] Architecture diagram in README updated to show the full IPC path
+- [x] Per-message IPC latency: **77 ns** (SPSC atomic CAS, no kernel, no copy)
+- [x] 44 tests passing
+
+---
+
 ## Non-Goals
 - Multi-node / replication — out of scope
 - SQL interface — use DuckDB + Parquet for ad-hoc queries

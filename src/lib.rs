@@ -14,6 +14,6 @@ pub use hw::HardwareProfile;
 pub use store::CandleStore;
 pub use shm::{SpscWriter, SpscReader, SpscRing};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub use shm::{ShmRingWriter, ShmRingReader};
+pub use shm::{ShmRingWriter, ShmRingReader, ShmIngester};
 #[cfg(feature = "feed")]
 pub use feed::{BinanceFeed, Subscription};
