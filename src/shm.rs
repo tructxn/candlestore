@@ -409,6 +409,15 @@ mod shm_impl {
     /// Only the reader role modifies `tail`; the writer only modifies `head`.
     unsafe impl Send for ShmRingReader {}
 
+    /// SAFETY: `Sync` is sound for `ShmRingReader` because all *mutating*
+    /// methods (`try_pop`, `pop`) maintain the SPSC invariant: exactly one
+    /// consumer thread advances `tail`. All other methods (`depth`,
+    /// `capacity`) only do atomic loads on the shared header — safe from any
+    /// number of concurrent observer threads (e.g. a metrics sidecar). The
+    /// SPSC contract is a documented user obligation; the type does not
+    /// enforce it.
+    unsafe impl Sync for ShmRingReader {}
+
     impl ShmRingReader {
         /// Open an existing shared-memory ring created by [`ShmRingWriter::create`].
         ///
@@ -491,6 +500,24 @@ mod shm_impl {
             }
         }
 
+        /// Current ring depth — number of slots holding unread data.
+        ///
+        /// Reads `head` and `tail` with `Acquire` ordering. Safe to call from
+        /// any thread (does not mutate the consumer's logical position) — only
+        /// the consumer's own thread should be calling `try_pop` concurrently.
+        #[inline]
+        pub fn depth(&self) -> u64 {
+            // SAFETY: `ptr` is a valid mapping containing an `ShmHeader` at offset 0.
+            let header = unsafe { &*(self.ptr as *const ShmHeader) };
+            let head = header.head.load(Ordering::Acquire);
+            let tail = header.tail.load(Ordering::Acquire);
+            head.wrapping_sub(tail)
+        }
+
+        /// Configured ring capacity (in slots).
+        #[inline]
+        pub fn capacity(&self) -> usize { self.capacity }
+
         /// Try to pop without blocking. Returns `None` if the ring is empty.
         #[inline]
         pub fn try_pop(&self) -> Option<Candle> {
@@ -546,35 +573,80 @@ mod shm_impl {
     ///
     /// // writer.push(candle) in another thread / process
     /// ```
+    /// Lifetime stats for an `ShmIngester`. Polled by the observability
+    /// sidecar; see `src/bin/market_hub.rs` for an example.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct IngesterStats {
+        /// Lifetime candles popped from the ring and forwarded to the store.
+        pub popped_total: u64,
+        /// Instantaneous ring depth (unread messages waiting).
+        pub ring_depth:   u64,
+        /// Configured ring capacity.
+        pub ring_capacity: u64,
+    }
+
     pub struct ShmIngester {
         running: Arc<AtomicBool>,
         handle:  Option<std::thread::JoinHandle<()>>,
+        popped:  Arc<AtomicU64>,
+        reader:  Arc<ShmRingReader>,
     }
 
     impl ShmIngester {
-        /// Spawn the ingester thread.
+        /// Spawn the ingester thread, optionally pinning it to `core_id`.
         ///
-        /// The thread owns `reader` and `store`. It pops candles and calls
-        /// `store.append(symbol, candle)` until [`stop`](Self::stop) is called.
+        /// `core_id = Some(n)`: the inner thread calls `pin_to_core(n)` before
+        /// starting its pop loop (Linux: hard pin via `sched_setaffinity`;
+        /// macOS: best-effort `thread_policy_set` hint).
+        /// `core_id = None`: thread runs unpinned.
+        ///
+        /// The thread shares `reader` via `Arc` so the host process can query
+        /// `stats()` (depth, popped) for observability. Only the ingester
+        /// thread calls `try_pop`, preserving the SPSC invariant.
+        pub fn start_on_core(
+            reader:  ShmRingReader,
+            store:   Arc<crate::store::CandleStore>,
+            symbol:  impl Into<String>,
+            core_id: Option<usize>,
+        ) -> Self {
+            let running  = Arc::new(AtomicBool::new(true));
+            let popped   = Arc::new(AtomicU64::new(0));
+            let reader   = Arc::new(reader);
+
+            let running2 = Arc::clone(&running);
+            let popped2  = Arc::clone(&popped);
+            let reader2  = Arc::clone(&reader);
+            let symbol   = symbol.into();
+
+            let handle = std::thread::Builder::new()
+                .name("shm-ingester".into())
+                .spawn(move || {
+                    if let Some(c) = core_id {
+                        crate::affinity::pin_to_core(c);
+                    }
+                    while running2.load(Ordering::Relaxed) {
+                        match reader2.try_pop() {
+                            Some(candle) => {
+                                store.append(&symbol, candle);
+                                popped2.fetch_add(1, Ordering::Relaxed);
+                            }
+                            None => std::hint::spin_loop(),
+                        }
+                    }
+                })
+                .expect("spawn shm-ingester thread");
+
+            Self { running, handle: Some(handle), popped, reader }
+        }
+
+        /// Spawn the ingester thread on whichever core the OS scheduler picks.
+        /// Equivalent to `start_on_core(reader, store, symbol, None)`.
         pub fn start(
             reader: ShmRingReader,
             store:  Arc<crate::store::CandleStore>,
             symbol: impl Into<String>,
         ) -> Self {
-            let running  = Arc::new(AtomicBool::new(true));
-            let running2 = Arc::clone(&running);
-            let symbol   = symbol.into();
-
-            let handle = std::thread::spawn(move || {
-                while running2.load(Ordering::Relaxed) {
-                    match reader.try_pop() {
-                        Some(candle) => store.append(&symbol, candle),
-                        None         => std::hint::spin_loop(),
-                    }
-                }
-            });
-
-            Self { running, handle: Some(handle) }
+            Self::start_on_core(reader, store, symbol, None)
         }
 
         /// Signal the ingester thread to stop and wait for it to exit.
@@ -582,6 +654,15 @@ mod shm_impl {
             self.running.store(false, Ordering::Relaxed);
             if let Some(h) = self.handle.take() {
                 let _ = h.join();
+            }
+        }
+
+        /// Lifetime counter snapshot for metrics export.
+        pub fn stats(&self) -> IngesterStats {
+            IngesterStats {
+                popped_total:  self.popped.load(Ordering::Relaxed),
+                ring_depth:    self.reader.depth(),
+                ring_capacity: self.reader.capacity() as u64,
             }
         }
     }
@@ -595,7 +676,7 @@ mod shm_impl {
 
 // Re-export platform types at module level.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub use shm_impl::{ShmRingReader, ShmRingWriter, ShmIngester};
+pub use shm_impl::{ShmRingReader, ShmRingWriter, ShmIngester, IngesterStats};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests

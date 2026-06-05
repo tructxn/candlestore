@@ -1,7 +1,11 @@
 use crate::Candle;
 
 /// Fixed-capacity ring buffer for candles.
-/// Oldest entry is overwritten when full.
+///
+/// Oldest entry is overwritten when full. Candles are assumed to be inserted
+/// in monotonically non-decreasing `ts` order — i.e. real time-series data
+/// (Binance closed klines, Coinbase trade ticks, etc.). This assumption is
+/// what makes range queries O(log n) instead of O(n).
 pub struct RingBuffer {
     buf:   Box<[Candle]>,
     head:  usize,   // next write position
@@ -24,31 +28,118 @@ impl RingBuffer {
         if self.len < self.buf.len() { self.len += 1; }
     }
 
-    /// Returns candles in chronological order (oldest first).
-    pub fn as_slice(&self) -> Vec<Candle> {
-        if self.len == 0 { return vec![]; }
+    // ── physical layout helpers ──────────────────────────────────────────────
+    //
+    // The ring stores candles in two layouts:
+    //   - Not full (len < cap): logical [0..len] == physical buf[0..len]
+    //   - Full   (len == cap): logical[0] == physical buf[head] (oldest);
+    //                          subsequent logical positions wrap modulo cap.
+    //
+    // All public APIs operate on *logical* indices where 0 = oldest.
+
+    /// Physical buffer index for logical position `i`.
+    /// Caller must ensure `i < self.len`.
+    #[inline]
+    fn physical_idx(&self, i: usize) -> usize {
         let cap = self.buf.len();
         let start = if self.len < cap { 0 } else { self.head };
-        (0..self.len)
-            .map(|i| self.buf[(start + i) % cap])
-            .collect()
+        let raw = start + i;
+        if raw >= cap { raw - cap } else { raw }
     }
 
-    /// Range query — returns candles where from_ts ≤ ts ≤ to_ts.
+    /// Timestamp at logical position `i`. Caller must ensure `i < self.len`.
+    #[inline]
+    fn ts_at(&self, i: usize) -> i64 {
+        self.buf[self.physical_idx(i)].ts
+    }
+
+    /// Smallest logical index `i` such that `ts_at(i) >= threshold`,
+    /// or `self.len` if no such index exists. O(log n).
+    fn lower_bound_idx(&self, threshold: i64) -> usize {
+        let mut lo = 0;
+        let mut hi = self.len;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.ts_at(mid) < threshold {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// Smallest logical index `i` such that `ts_at(i) > threshold`,
+    /// or `self.len` if all candles have `ts <= threshold`. O(log n).
+    fn upper_bound_idx(&self, threshold: i64) -> usize {
+        let mut lo = 0;
+        let mut hi = self.len;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.ts_at(mid) <= threshold {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// Copy logical range `[lo, hi)` into a fresh `Vec`. Handles ring wrap.
+    fn copy_logical_range(&self, lo: usize, hi: usize) -> Vec<Candle> {
+        debug_assert!(lo <= hi && hi <= self.len);
+        if lo == hi { return Vec::new(); }
+
+        let cap = self.buf.len();
+        let start_phys = self.physical_idx(lo);
+        let count = hi - lo;
+        let mut out = Vec::with_capacity(count);
+
+        // Either the whole logical range is contiguous in physical memory,
+        // or it wraps once at `cap`. Use two `extend_from_slice` calls so we
+        // get a memcpy per contiguous chunk instead of a per-element copy.
+        if start_phys + count <= cap {
+            out.extend_from_slice(&self.buf[start_phys..start_phys + count]);
+        } else {
+            let first = cap - start_phys;
+            out.extend_from_slice(&self.buf[start_phys..cap]);
+            out.extend_from_slice(&self.buf[0..count - first]);
+        }
+        out
+    }
+
+    // ── public API ───────────────────────────────────────────────────────────
+
+    /// Returns candles in chronological order (oldest first).
+    /// O(n) memcpy (one or two contiguous chunks).
+    pub fn as_slice(&self) -> Vec<Candle> {
+        self.copy_logical_range(0, self.len)
+    }
+
+    /// Range query — returns candles where `from_ts <= ts <= to_ts`.
+    /// O(log n + k) where k is the result size. Relies on monotonic ts.
     pub fn range(&self, from_ts: i64, to_ts: i64) -> Vec<Candle> {
-        self.as_slice()
-            .into_iter()
-            .filter(|c| c.ts >= from_ts && c.ts <= to_ts)
-            .collect()
+        if self.len == 0 || from_ts > to_ts { return Vec::new(); }
+        let lo = self.lower_bound_idx(from_ts);
+        let hi = self.upper_bound_idx(to_ts);
+        self.copy_logical_range(lo, hi)
+    }
+
+    /// Returns the last `n` candles (newest), or all if `n > len`.
+    /// O(min(n, len)) memcpy — never scans the full buffer.
+    pub fn last_n(&self, n: usize) -> Vec<Candle> {
+        let take = n.min(self.len);
+        if take == 0 { return Vec::new(); }
+        self.copy_logical_range(self.len - take, self.len)
     }
 
     pub fn len(&self) -> usize { self.len }
     pub fn capacity(&self) -> usize { self.buf.len() }
     pub fn is_empty(&self) -> bool { self.len == 0 }
 
-    /// Oldest timestamp in buffer, if any.
+    /// Oldest timestamp in buffer, if any. O(1).
     pub fn oldest_ts(&self) -> Option<i64> {
-        self.as_slice().first().map(|c| c.ts)
+        if self.len == 0 { None } else { Some(self.ts_at(0)) }
     }
 }
 
@@ -122,5 +213,110 @@ mod tests {
         rb.push(candle(3, 3.0));
         rb.push(candle(4, 4.0)); // wraps, oldest is now ts=2
         assert_eq!(rb.oldest_ts(), Some(2));
+    }
+
+    // ── binary-search range correctness ─────────────────────────────────────
+
+    #[test]
+    fn range_returns_empty_on_inverted_bounds() {
+        let mut rb = RingBuffer::new(4);
+        rb.push(candle(1, 1.0));
+        rb.push(candle(2, 2.0));
+        assert!(rb.range(10, 5).is_empty()); // from > to
+    }
+
+    #[test]
+    fn range_inclusive_on_both_ends() {
+        let mut rb = RingBuffer::new(8);
+        for i in 1..=5i64 { rb.push(candle(i, i as f64)); }
+        let r = rb.range(2, 4);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0].ts, 2);
+        assert_eq!(r[2].ts, 4);
+    }
+
+    #[test]
+    fn range_handles_duplicate_timestamps() {
+        let mut rb = RingBuffer::new(8);
+        rb.push(candle(1, 1.0));
+        rb.push(candle(2, 2.0));
+        rb.push(candle(2, 2.1));
+        rb.push(candle(2, 2.2));
+        rb.push(candle(3, 3.0));
+        let r = rb.range(2, 2);
+        assert_eq!(r.len(), 3);
+        assert!(r.iter().all(|c| c.ts == 2));
+    }
+
+    #[test]
+    fn range_works_across_ring_wrap() {
+        let mut rb = RingBuffer::new(4);
+        // push 7 candles into a capacity-4 ring — wraps once
+        for i in 1..=7i64 { rb.push(candle(i, i as f64)); }
+        // logical content should be ts=4,5,6,7
+        let r = rb.range(0, i64::MAX);
+        assert_eq!(r.len(), 4);
+        assert_eq!(r[0].ts, 4);
+        assert_eq!(r[3].ts, 7);
+
+        let mid = rb.range(5, 6);
+        assert_eq!(mid.len(), 2);
+        assert_eq!(mid[0].ts, 5);
+        assert_eq!(mid[1].ts, 6);
+    }
+
+    #[test]
+    fn range_window_outside_returns_empty() {
+        let mut rb = RingBuffer::new(4);
+        for i in 1..=3i64 { rb.push(candle(i, i as f64)); }
+        assert!(rb.range(100, 200).is_empty()); // entirely above
+        assert!(rb.range(-50, -1).is_empty());  // entirely below
+    }
+
+    #[test]
+    fn last_n_returns_newest_candles_in_order() {
+        let mut rb = RingBuffer::new(8);
+        for i in 1..=5i64 { rb.push(candle(i, i as f64)); }
+        let last = rb.last_n(3);
+        assert_eq!(last.len(), 3);
+        assert_eq!(last[0].ts, 3);
+        assert_eq!(last[2].ts, 5);
+    }
+
+    #[test]
+    fn last_n_caps_at_len() {
+        let mut rb = RingBuffer::new(4);
+        rb.push(candle(1, 1.0));
+        rb.push(candle(2, 2.0));
+        let last = rb.last_n(100);
+        assert_eq!(last.len(), 2);
+        assert_eq!(last[0].ts, 1);
+    }
+
+    #[test]
+    fn last_n_works_across_ring_wrap() {
+        let mut rb = RingBuffer::new(4);
+        for i in 1..=7i64 { rb.push(candle(i, i as f64)); }
+        // ring holds ts=4..=7 logically; last 2 should be ts=6,7
+        let last = rb.last_n(2);
+        assert_eq!(last.len(), 2);
+        assert_eq!(last[0].ts, 6);
+        assert_eq!(last[1].ts, 7);
+    }
+
+    #[test]
+    fn last_n_zero_is_empty() {
+        let mut rb = RingBuffer::new(4);
+        rb.push(candle(1, 1.0));
+        assert!(rb.last_n(0).is_empty());
+    }
+
+    #[test]
+    fn oldest_ts_is_o1_after_wrap() {
+        // smoke test that oldest_ts no longer allocates: build a giant ring
+        // and call it repeatedly. If it were O(n) per call this would crawl.
+        let mut rb = RingBuffer::new(100_000);
+        for i in 1..=200_000i64 { rb.push(candle(i, i as f64)); }
+        for _ in 0..10_000 { assert_eq!(rb.oldest_ts(), Some(100_001)); }
     }
 }

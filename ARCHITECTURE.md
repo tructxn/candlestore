@@ -190,11 +190,42 @@ to exceed your actual active symbol count and eviction never occurs.
 
 ### Concurrency model
 
-`CandleStore` is wrapped in `Arc<RwLock<Inner>>`. Reads (`range()`) acquire a
-shared read lock; writes (`append()`) acquire an exclusive write lock only long
-enough to update the ring buffer and LRU order. Parquet I/O happens **outside the
-lock** — the eviction payload is extracted under the write lock, then serialised
-after it's released. Readers are never blocked by disk I/O.
+`CandleStore` holds an outer `RwLock<HashMap<String, Arc<Entry>>>` plus a
+per-`Entry` `RwLock<RingBuffer>`. The outer lock guards add/remove of symbols
+only — every operation acquires its read-lock briefly (~10 ns) to clone an
+`Arc<Entry>`, then drops it. The inner per-symbol RwLock is what guards each
+symbol's ring. Result: appending to BTC does **not** block reads of ETH.
+
+LRU is *approximate* — each `Entry` carries an `AtomicU64 last_access` that
+gets stored on every append (a single `fetch_add` of a global tick). On
+eviction, the store scans entries once to find the smallest timestamp. No
+`VecDeque` to keep ordered on every access; no O(n) `lru_promote`.
+
+Parquet I/O on eviction happens **under the outer write lock** for data
+integrity — the LRU snapshot lives in the map while the spill runs. If
+`parquet::spill` fails, the entry is left in place and the new candle is
+rejected with `AppendError::EvictionSpillFailed`. The tradeoff: eviction
+serialises all store operations for the duration of the spill (~100 ms
+typical). Eviction is rare in well-sized configurations.
+
+### Reactive consumer protocol
+
+The store maintains `AtomicU64 version`, bumped on every successful append
+(Release ordering). Consumers spin on `wait_for_change(last_seen)` (Acquire
+load) on their own pinned core. Wake-up p50 = **14 µs** (vs the 50 ms wall-
+clock-poll approach this replaced). For graceful shutdown, `signal_waiters()`
+bumps version once without writing data so the spinner can observe its own
+shutdown flag and exit.
+
+### Append error contract
+
+| API                                         | On spill failure          |
+|---------------------------------------------|---------------------------|
+| `try_append(symbol, candle) -> Result<…>`   | Returns `AppendError::EvictionSpillFailed`; state unchanged |
+| `append(symbol, candle) -> ()`              | Logs ERROR + increments `appends_rejected_total`; new candle dropped, existing data preserved |
+
+The old behaviour (silent data loss when the LRU's `Vec<Candle>` snapshot
+was dropped on spill failure) is gone.
 
 ---
 
@@ -247,33 +278,37 @@ thread often hits cache lines already warm from the ingester's recent `append()`
 All numbers measured on Apple M-series, release build (`cargo bench --bench ipc_comparison`).
 
 ```
-Stage                               Latency         Source
+Stage                                Latency         Source
 ────────────────────────────────────────────────────────────────────
-Exchange WebSocket → parse          ~50–500 µs      network + JSON
-ShmRingWriter::push()               ~31 ns          atomic Release store
-SHM ring transit (cross-process)    ~77 ns          cache line bounce
-ShmRingReader::try_pop() + append() ~21 ns          atomic Acquire + store append
-CandleStore::append() (direct)      ~31 ns          RwLock + ring push
-CandleStore::range() (hot, W=1000)  ~25 µs          lock + linear scan, L3-resident
-Strategy compute (SMA crossover)    ~1–5 µs         floating-point, same data
-SpscRing<Signal>::push()            ~77 ns          same SPSC protocol as above
-SpscRing<Signal>::pop()             ~0 ns           (spin, usually empty)
+Exchange WebSocket → parse           ~50–500 µs      network + JSON
+ShmRingWriter::push()                ~31 ns          atomic Release store
+SHM ring transit (cross-process)     ~77 ns          cache line bounce
+ShmRingReader::try_pop() + append()  ~21 ns          atomic Acquire + store append
+CandleStore::append() (direct)       ~19 ns          per-symbol RwLock + ring push
+CandleStore::wait_for_change wake-up ~14 µs (p50)    cross-core version load
+CandleStore::last_n() (N=20)         ~80 ns          O(N) memcpy, no binary search
+CandleStore::range() (W=1,000)       ~1.0 µs         O(log n) lower/upper bound + memcpy
+Strategy compute (SMA crossover)     ~1–5 µs         floating-point, same data
+SpscRing<Signal>::push()             ~77 ns          same SPSC protocol as above
+SpscRing<Signal>::pop()              ~0 ns           (spin, usually empty)
 ────────────────────────────────────────────────────────────────────
-Total (store-to-signal, no network) ~30 µs
+Total (store-to-signal, no network)  ~16 µs
 ```
 
 Network latency to the exchange (co-located): 50–500 µs.
-Store-to-signal path: ~30 µs.
+Store-to-signal path: ~16 µs (was ~30 µs before reactive wake-up + binary search).
 The bottleneck is exchange round-trip, not the internal kernel.
 
 ### Throughput
 
-| Component                  | Throughput        |
-|----------------------------|-------------------|
-| ShmRingWriter::push        | ~32M candles/sec  |
-| ShmIngester → store        | ~19M candles/sec  |
-| Direct store.append()      | ~32M candles/sec  |
-| store.range() (W=5,000)    | ~160M candles/sec |
+| Component                         | Throughput        |
+|-----------------------------------|-------------------|
+| ShmRingWriter::push               | ~32M candles/sec  |
+| ShmIngester → store               | ~19M candles/sec  |
+| Direct store.append() (1 thread)  | ~53M candles/sec  |
+| Direct store.append() (4 sym × 4 t)| ~6.2M ops/s/thread (1.59× parallelism) |
+| store.range() (W=5,000)           | ~1.2G elem/sec    |
+| store.last_n (N=1,000)            | ~1.0G elem/sec    |
 
 At 19M ingested candles/sec, the kernel can sustain 19 exchanges each sending
 1M candles/sec simultaneously before the ingester becomes the bottleneck.
@@ -390,3 +425,131 @@ The kernel is intentionally minimal. Natural next steps:
 | Real order submission      | Extend executor thread          | Exchange REST/FIX, risk gate first    |
 | NUMA-aware allocation      | `affinity.rs`                   | `numa_alloc_onnode` for ring memory   |
 | Kernel bypass networking   | Replace WebSocket client        | DPDK / RDMA for sub-µs market data   |
+
+---
+
+## 11. Observability
+
+The library never emits metrics on the hot path — at 53M append/sec a 5 ns
+`metrics::counter!` call would cost ~26% of throughput. Instead:
+
+- `CandleStore` and `ShmIngester` maintain internal `AtomicU64` counters
+  (appends, evictions, parquet spill bytes/errors, popped, ring depth).
+- `CandleStore::snapshot() -> StoreSnapshot` and `ShmIngester::stats() ->
+  IngesterStats` expose them as cheap value snapshots (~6 atomic loads).
+- Binaries install `tracing-subscriber` + `metrics-exporter-prometheus`.
+- A 1-Hz metrics-poller thread reads snapshots and emits Prometheus counters
+  on the `/metrics` HTTP endpoint.
+- Rare events (Parquet spill failures, ring-fill > 50%) are logged inline
+  via `tracing::error!` / `tracing::warn!`.
+
+### Metric inventory
+
+| Metric                                       | Type    | Source            |
+|----------------------------------------------|---------|-------------------|
+| `candlestore_appends_total`                  | counter | store.version     |
+| `candlestore_symbols_active`                 | gauge   | store.map.len     |
+| `candlestore_evictions_total`                | counter | store.evictions   |
+| `candlestore_parquet_spill_bytes_total`      | counter | store             |
+| `candlestore_parquet_spill_errors_total`     | counter | store             |
+| `candlestore_appends_rejected_total`         | counter | store             |
+| `candlestore_ingest_popped_total`            | counter | ingester          |
+| `candlestore_ingest_ring_depth`              | gauge   | shm reader depth  |
+| `candlestore_ingest_ring_fill_ratio`         | gauge   | shm reader        |
+| `candlestore_signals_total`                  | counter | strategy thread   |
+| `candlestore_executor_signals_total`         | counter | executor thread   |
+| `candlestore_executor_position`              | gauge   | executor thread   |
+
+No per-symbol labels — high cardinality would inflate Prometheus storage.
+Per-symbol diagnosis comes from structured `tracing` events instead.
+
+### Environment
+
+| Variable        | Default | Description                                  |
+|-----------------|---------|----------------------------------------------|
+| `METRICS_PORT`  | 9090 (feed) / 9091 (hub) | Prometheus HTTP listen port |
+| `RUST_LOG`      | `info`  | `tracing` filter (`debug,hyper=warn`, etc.)  |
+
+---
+
+## 12. Graceful Shutdown
+
+Both binaries install `SIGINT` + `SIGTERM` handlers via `signal-hook` that
+flip an `Arc<AtomicBool>` shutdown flag. Each worker thread observes the
+flag at its idle/spin checkpoint and exits.
+
+### market_hub shutdown sequence
+
+```
+SIGTERM arrives
+  ↓
+signal_hook handler flips shutdown=true
+  ↓
+main thread (park_timeout 100ms) wakes
+  ↓
+store.signal_waiters() — bumps version to unblock strategy's wait_for_change
+  ↓
+strategy.thread().unpark() / executor.thread().unpark() / poller.thread().unpark()
+  ↓
+each worker checks flag → break → return
+  ↓
+main joins each thread (5s timeout, with is_finished() poll)
+  ↓
+drop(Arc<ShmIngester>) — last ref → ShmIngester::Drop → stop() → ingester thread joins
+  ↓
+ShmRingReader::Drop → munmap
+  ↓
+drop(Arc<CandleStore>)
+  ↓
+main exits — "graceful shutdown complete"
+```
+
+### feed_handler shutdown sequence
+
+```
+SIGTERM arrives → shutdown=true
+  ↓
+hot loop top: `while !shutdown.load() { ... }` exits
+  OR push_or_shutdown returns false (ring full + flag set, no consumer)
+  ↓
+drop(ShmRingWriter) → munmap + shm_unlink (segment removed for fresh restart)
+  ↓
+main exits — "SHM segment unlinked, feed_handler stopped"
+```
+
+**Caveat**: in-flight data sitting in the SHM ring at shutdown is lost. A
+drain-then-exit phase (writer stops, reader drains, then both exit) is a
+future improvement.
+
+---
+
+## 13. Parquet Schema Versioning
+
+Every cold-storage file carries Arrow schema metadata identifying the writer:
+
+```
+candlestore.brand           = "candlestore"
+candlestore.schema_version  = "1"
+```
+
+`check_schema_compat` runs before any read. The full read-behavior matrix:
+
+| File state                                           | Result                          |
+|------------------------------------------------------|----------------------------------|
+| Brand + version == current                           | Read normally                    |
+| Brand + version < current                            | Read normally                    |
+| Brand + version > current                            | `SpillError::IncompatibleVersion`|
+| No brand metadata (pre-versioning v0 files)          | Read as v0 (column-compat)       |
+| Required column missing                              | `SpillError::MissingColumn`      |
+| Required column has wrong type                       | `SpillError::WrongColumnType`    |
+| Extra unknown columns present                        | Ignore (forward-compat)          |
+
+The previous read path used positional column lookup with `unwrap()` — adding
+a field to `Candle` would crash the process on the next cold read. The new
+path looks up by name and returns structured errors, so `query_cold` can
+skip an unreadable file (logged via `tracing::warn!`) and still return the
+readable history.
+
+When adding a `Candle` field: bump `parquet::SCHEMA_VERSION` to `2`, add the
+column at the **end** of the schema as nullable, ship. Old binaries keep
+reading old files; new binaries read both.

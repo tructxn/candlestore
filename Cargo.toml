@@ -18,12 +18,23 @@ feed = [
 ]
 
 [dependencies]
-hashbrown = "0.14"
+hashbrown   = "0.14"
 parking_lot = "0.12"
-arrow = { version = "53", features = ["ipc"] }
-parquet = "53"
-thiserror = "1"
-num_cpus = "1"
+arrow       = { version = "53", features = ["ipc"] }
+parquet     = "53"
+thiserror   = "1"
+num_cpus    = "1"
+
+# observability — lib emits via tracing facade and exposes atomic counters.
+# Subscribers/exporters are installed by binaries (see src/bin/*).
+tracing                     = "0.1"
+tracing-subscriber          = { version = "0.3", features = ["env-filter", "fmt"] }
+metrics                     = "0.23"
+metrics-exporter-prometheus = { version = "0.15", default-features = false, features = ["http-listener"] }
+
+# Graceful shutdown — POSIX signal handling for SIGINT/SIGTERM. Unix only;
+# Windows would need ctrlc or similar, but the lib is already Unix-only (shm).
+signal-hook                 = "0.3"
 
 # feed feature deps (optional)
 tokio             = { version = "1", features = ["full"], optional = true }
@@ -72,3 +83,9 @@ name = "shm_reader"
 
 [[example]]
 name = "shm_pipeline"
+
+[[example]]
+name = "reactive_latency"
+
+[[example]]
+name = "multi_symbol_contention"

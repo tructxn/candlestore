@@ -133,6 +133,109 @@ Run in two terminals:
 
 ---
 
+## Phase 10 — Production Readiness ✅
+> Close the gap from "impressive demo" to "I would deploy this." Driven by
+> an honest review against enterprise standards; each sub-phase has its own
+> diff and proof.
+
+### 10.1 Reactive strategy — kill the 50 ms sleep ✅
+- [x] `CandleStore::version()` + `wait_for_change(last_seen)` — pinned-core
+      spin on an `AtomicU64` append counter (Release/Acquire ordering)
+- [x] Strategy thread no longer polls on a wall-clock timer
+- [x] `examples/reactive_latency.rs` measures wake-up: **p50 = 14 µs, p99 = 31 µs**
+      (was 50 ms bounded below by the sleep) — **~3,500× faster reaction**
+
+### 10.2 Binary-search range query ✅
+- [x] `RingBuffer::range` rewritten using `O(log n)` lower/upper-bound search
+      + `extend_from_slice` memcpy (one or two contiguous chunks for ring wrap)
+- [x] New `RingBuffer::last_n(n)` — direct `O(n)` newest-K access, no binary
+      search, no Vec-of-everything allocation
+- [x] `CandleStore::last_n(symbol, n)` exposed; strategy uses it instead of
+      `range(0, i64::MAX)`
+- [x] Numbers: `range(W=100)` 24 µs → 210 ns (**114×**); `range(W=1k)` 25 µs →
+      1.0 µs (**25×**); `last_n(N=10)` 65 ns; `last_n(N=100)` 108 ns
+- [x] candlestore now matches `Vec + partition_point` baseline while keeping
+      concurrent RwLock reads, LRU, and multi-symbol — "naive bisect wins"
+      narrative gone
+
+### 10.3 Per-symbol locks ✅
+- [x] `RwLock<Inner>` → `RwLock<HashMap<String, Arc<Entry>>>` + per-`Entry`
+      `RwLock<RingBuffer>`. Outer lock guards add/remove only
+- [x] Approximate LRU via `Entry::last_access: AtomicU64` — removed O(n)
+      `lru_promote` from every append
+- [x] Reads/writes on different symbols don't block each other (test:
+      `concurrent_reads_dont_block_writes_on_other_symbol`)
+- [x] Single-threaded `append` throughput: 29M → **53M ops/s** (1.85×)
+- [x] Multi-symbol parallelism: 4 threads × 4 symbols = 1.59× vs same-symbol
+      contention (`examples/multi_symbol_contention.rs`)
+
+### 10.4 Tracing + Prometheus metrics ✅
+- [x] All `println!` replaced with structured `tracing::info!`/`warn!`/`error!`
+- [x] `metrics-exporter-prometheus` HTTP `/metrics` endpoint on `METRICS_PORT`
+      (feed_handler: 9090, market_hub: 9091)
+- [x] `CandleStore::snapshot()` returns `StoreSnapshot` (lifetime counters
+      via cheap atomic loads, never on the hot path)
+- [x] `ShmRingReader::depth()` + `ShmIngester::stats()` for backpressure
+      visibility
+- [x] 11 named Prometheus metrics covering appends, evictions, parquet
+      spills, ring depth/fill, signals, executor position
+- [x] 1 Hz polling thread in market_hub reads snapshots and emits metrics —
+      hot path pays zero metric overhead
+- [x] `ShmRingReader` made `Sync` with documented SPSC safety contract
+
+### 10.5 Plumb SpillError properly ✅
+- [x] New `pub enum AppendError::EvictionSpillFailed { evicted_symbol,
+      candles_lost, source: SpillError }`
+- [x] `CandleStore::try_append() -> Result<(), AppendError>` for strict
+      callers; `append()` retained as fire-and-forget convenience that logs
+      and increments `appends_rejected_total`
+- [x] Eviction's Parquet spill now happens **under the map write lock** —
+      no window where the LRU snapshot exists only in a transient `Vec`
+      that gets dropped on failure
+- [x] On spill failure: existing data preserved in RAM, new candle rejected,
+      structured error returned. Was: silent data loss
+- [x] `appends_rejected_total` Prometheus counter + ERROR-level tracing log
+
+### 10.6 Graceful SIGTERM ✅
+- [x] `signal-hook` SIGINT/SIGTERM → `Arc<AtomicBool>` shutdown flag
+- [x] `CandleStore::signal_waiters()` bumps version to unblock pinned
+      consumers from `wait_for_change`
+- [x] All worker threads (strategy, executor, metrics poller) honour the
+      flag and exit cleanly
+- [x] `ShmIngester::start_on_core` for clean ownership in `main` (fixes a
+      pre-existing JoinHandle-drop lifetime bug)
+- [x] `push_or_shutdown` helper in feed_handler — `try_push` with shutdown
+      check in the spin-wait, fixes infinite hang when consumer disappears
+- [x] Verified end-to-end: SIGTERM → "graceful shutdown complete" exit 0,
+      SHM segment unlinked, fresh start works
+- [x] 5 s timeout on thread joins with `is_finished()` poll — detach-with-
+      warning if a worker misses the shutdown flag
+
+### 10.7 Parquet schema versioning ✅
+- [x] `pub const SCHEMA_VERSION: u32 = 1` embedded in Arrow schema metadata
+      (`candlestore.brand` + `candlestore.schema_version`)
+- [x] `check_schema_compat` runs before any read — rejects newer-than-known
+      files with `SpillError::IncompatibleVersion`
+- [x] Column lookup by name (was: positional `.unwrap()`) — extra unknown
+      columns are forward-compat ignored; missing required columns surface
+      as `SpillError::MissingColumn` (no panics)
+- [x] Pre-versioning (v0) files read transparently for back-compat
+- [x] `query_cold` skips unreadable files with `tracing::warn!` instead of
+      silently swallowing
+- [x] 6 new tests cover the full matrix: round-trip metadata; v0 back-compat;
+      future-version rejection; missing-column handling; extra-column
+      forward-compat; query_cold skips bad files
+
+**Phase 10 status: 69 tests passing, 0 ignored. Production hot path:**
+- store append: 53M ops/s single-thread, 6.2M ops/s/thread with 4 symbols
+- store range: 210 ns (W=100)
+- store last_n: 65 ns (N=10)
+- strategy wake-up: 14 µs p50
+- IPC SPSC ring: ~77 ns rendezvous, ~19 Melem/s sustained
+- SHM pipeline end-to-end: 19M candles/sec (1.7× IPC overhead vs direct)
+
+---
+
 ## Non-Goals
 - Multi-node / replication — out of scope
 - SQL interface — use DuckDB + Parquet for ad-hoc queries

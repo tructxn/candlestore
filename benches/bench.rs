@@ -37,6 +37,19 @@ fn bench_range_query(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_last_n(c: &mut Criterion) {
+    let mut group = c.benchmark_group("last_n");
+    for n in [10usize, 100, 1_000] {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            let store = CandleStore::new(10);
+            for i in 0..10_000i64 { store.append("BTC/USDT:1m", make_candle(i)); }
+            b.iter(|| black_box(store.last_n(black_box("BTC/USDT:1m"), n)));
+        });
+    }
+    group.finish();
+}
+
 fn bench_lru_eviction(c: &mut Criterion) {
     c.bench_function("lru_eviction_100_symbols", |b| {
         b.iter(|| {
@@ -115,6 +128,7 @@ criterion_group!(
     benches,
     bench_append,
     bench_range_query,
+    bench_last_n,
     bench_lru_eviction,
     bench_naive_vec_range,
     bench_naive_hashmap_range,
