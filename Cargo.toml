@@ -3,4 +3,20 @@ name = "candlestore"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "candlestore"
+path = "src/lib.rs"
+
 [dependencies]
+hashbrown = "0.14"          # faster HashMap
+parking_lot = "0.12"        # faster Mutex/RwLock than std
+arrow = { version = "53", features = ["ipc"] }
+parquet = "53"
+thiserror = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "bench"
+harness = false
