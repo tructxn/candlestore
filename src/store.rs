@@ -122,6 +122,11 @@ impl CandleStore {
     pub fn symbol_count(&self) -> usize {
         self.inner.read().symbols.len()
     }
+
+    /// Number of candles currently held in the hot ring for `symbol`.
+    pub fn candle_count(&self, symbol: &str) -> usize {
+        self.inner.read().symbols.get(symbol).map(|e| e.buf.len()).unwrap_or(0)
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

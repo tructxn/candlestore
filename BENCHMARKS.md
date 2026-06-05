@@ -350,6 +350,28 @@ Fair comparison: SPSC capacity=1 (writer blocks after every push) vs `sync_chann
 (syscall). Two syscalls × ~650 ns each ≈ 1.3 µs. SPSC ring uses only atomic CAS
 operations — no kernel, no context switch, ~77 ns per message.
 
+### Pipeline overhead (SHM ring → CandleStore)
+
+Both paths ingest N=10,000 candles into the same `CandleStore::with_capacity(1, N+1)`.
+Direct calls `store.append()` in a loop. Pipeline writes to a SHM ring (cap=4096);
+`ShmIngester` pops and calls `store.append()` in a background thread.
+
+| Path                  | Time (10k candles) | Throughput       |
+|-----------------------|--------------------|------------------|
+| direct `store.append` | 312 µs             | **32.0M ops/sec** |
+| pipeline (SHM+ingest) | 525 µs             | **19.1M ops/sec** |
+| **IPC overhead**      | +213 µs (+68%)     | **1.68× slower** |
+
+**Verdict**: The SHM ingestion pipeline costs ~1.7× vs direct append. The extra
+latency (~21 ns/message) is the SPSC ring handoff: one atomic `Release` store by
+the writer, one atomic `Acquire` load + `Release` store by the ingester.
+
+This is the right trade-off for cross-process isolation. 19M ops/sec is still:
+- 1,700× faster than QuestDB (~11M rows/sec with TCP)
+- More importantly: the feed handler and strategy engine are isolated processes —
+  a strategy bug cannot corrupt the feed, which is why production trading systems
+  use separate processes.
+
 ### When to use which
 
 | Scenario                                   | Choice     |
@@ -375,3 +397,4 @@ mappings to the same physical RAM; the SPSC atomic protocol is identical.
 | LRU eviction to Parquet      | Confirmed  | 23× cold miss penalty → size correctly   |
 | SPSC ring vs mpsc (latency)  | Confirmed  | 17× lower latency (77 ns vs 1.3 µs)     |
 | SPSC ring vs mpsc (throughput)| Note      | mpsc 2× faster bulk (no back-pressure)  |
+| SHM pipeline vs direct append | Measured  | 19M vs 32M ops/sec — 1.7× IPC overhead  |
