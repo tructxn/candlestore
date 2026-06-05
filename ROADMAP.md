@@ -40,15 +40,16 @@ Hot data in RAM, cold data spilled to Parquet. No server, no GC, no SQL overhead
 
 ---
 
-## Phase 4 — Binance WebSocket Feed 🔲
+## Phase 4 — Binance WebSocket Feed ✅
 > Populate the store with real BTC/USDT candle data.
 
-- [ ] Connect to Binance public WebSocket kline stream
-- [ ] Parse kline JSON → `Candle`
-- [ ] Feed into `CandleStore` in real time
-- [ ] Support multiple symbols + timeframes simultaneously
-- [ ] Graceful reconnect on disconnect
-- [ ] Example binary: `examples/binance_feed.rs`
+- [x] Connect to Binance public combined stream WebSocket
+- [x] Parse kline JSON → `Candle` (only closed candles stored)
+- [x] Feed into `CandleStore` in real time via `BinanceFeed::run()`
+- [x] Support multiple symbols + timeframes simultaneously
+- [x] Graceful reconnect on any error (5s delay)
+- [x] Example binary: `examples/binance_feed.rs`
+- [x] Feature-gated behind `--features feed` — core lib stays zero async deps
 
 ---
 

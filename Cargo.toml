@@ -7,13 +7,29 @@ edition = "2024"
 name = "candlestore"
 path = "src/lib.rs"
 
+[features]
+feed = [
+    "dep:tokio",
+    "dep:tokio-tungstenite",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:futures-util",
+]
+
 [dependencies]
-hashbrown = "0.14"          # faster HashMap
-parking_lot = "0.12"        # faster Mutex/RwLock than std
+hashbrown = "0.14"
+parking_lot = "0.12"
 arrow = { version = "53", features = ["ipc"] }
 parquet = "53"
 thiserror = "1"
-num_cpus = "1"              # physical core count
+num_cpus = "1"
+
+# feed feature deps (optional)
+tokio             = { version = "1", features = ["full"], optional = true }
+tokio-tungstenite = { version = "0.23", features = ["native-tls"], optional = true }
+serde             = { version = "1", features = ["derive"], optional = true }
+serde_json        = { version = "1", optional = true }
+futures-util      = { version = "0.3", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
@@ -23,8 +39,16 @@ libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-tempfile = "3"
+tempfile  = "3"
+tokio     = { version = "1", features = ["full"] }
 
 [[bench]]
-name = "bench"
+name    = "bench"
 harness = false
+
+[[example]]
+name              = "binance_feed"
+required-features = ["feed"]
+
+[[example]]
+name = "hw_probe"
