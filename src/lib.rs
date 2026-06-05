@@ -3,6 +3,7 @@ pub mod hw;
 pub mod ring_buffer;
 pub mod store;
 pub mod parquet;
+pub mod matching;
 #[cfg(feature = "feed")]
 pub mod feed;
 
