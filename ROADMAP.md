@@ -66,14 +66,15 @@ Hot data in RAM, cold data spilled to Parquet. No server, no GC, no SQL overhead
 
 ---
 
-## Phase 6 — Go Client 🔲
+## Phase 6 — Go Client ✅
 > Thin Go wrapper over the Rust library via FFI / C ABI.
 
-- [ ] Expose C ABI from Rust (`#[no_mangle]`, `extern "C"`)
-- [ ] Go bindings via `cgo`
-- [ ] Same API: `Append(symbol, candle)`, `Range(symbol, from, to)`
-- [ ] Example Go matching engine using candlestore as storage layer
-- [ ] This is the Zero Hash demo piece
+- [x] `src/ffi.rs` — C ABI with `#[unsafe(no_mangle)]` (Rust 2024 edition)
+- [x] `include/candlestore.h` — typed C header (`struct CandleStore` forward decl)
+- [x] `go-client/candlestore/candlestore.go` — cgo wrapper: `New`, `Append`, `Range`, `Close`
+- [x] `go-client/cmd/main.go` — SMA crossover strategy in Go, backed by Rust store
+- [x] Hardware detection exposed: `L3CacheBytes()` callable from Go
+- [x] Verified: same candle data + same strategy = same P&L in Go and Rust
 
 ---
 

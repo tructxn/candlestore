@@ -6,6 +6,7 @@ edition = "2024"
 [lib]
 name = "candlestore"
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]   # cdylib for C/Go FFI, rlib for Rust tests
 
 [features]
 feed = [
