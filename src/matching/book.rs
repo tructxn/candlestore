@@ -76,8 +76,7 @@ impl OrderBook {
 
     fn match_buy(&mut self, order: &mut Order, events: &mut Vec<TradeEvent>, ts: i64) {
         let limit_key = order.price.map(price_key);
-        loop {
-            let best = match self.asks.keys().next().copied() { Some(k) => k, None => break };
+        while let Some(best) = self.asks.keys().next().copied() {
             if limit_key.map(|lk| best > lk).unwrap_or(false) { break; }
             self.fill_at(best, order, events, ts);
             if self.asks.get(&best).map(|l| l.is_empty()).unwrap_or(true) { self.asks.remove(&best); }
@@ -87,8 +86,7 @@ impl OrderBook {
 
     fn match_sell(&mut self, order: &mut Order, events: &mut Vec<TradeEvent>, ts: i64) {
         let limit_key = order.price.map(price_key);
-        loop {
-            let best = match self.bids.keys().next_back().copied() { Some(k) => k, None => break };
+        while let Some(best) = self.bids.keys().next_back().copied() {
             if limit_key.map(|lk| best < lk).unwrap_or(false) { break; }
             self.fill_at(best, order, events, ts);
             if self.bids.get(&best).map(|l| l.is_empty()).unwrap_or(true) { self.bids.remove(&best); }
@@ -134,6 +132,7 @@ mod tests {
     fn buy_limit(id: u64, price: f64, qty: f64)  -> Order { Order::limit(id, "BTC", Side::Buy,  price, qty, 0) }
     fn sell_limit(id: u64, price: f64, qty: f64) -> Order { Order::limit(id, "BTC", Side::Sell, price, qty, 0) }
     fn buy_market(id: u64, qty: f64)             -> Order { Order::market(id, "BTC", Side::Buy,  qty, 0) }
+    #[allow(dead_code)]
     fn sell_market(id: u64, qty: f64)            -> Order { Order::market(id, "BTC", Side::Sell, qty, 0) }
 
     #[test]

@@ -22,7 +22,13 @@ pub extern "C" fn candlestore_new_hardware(max_symbols: c_int) -> *mut CandleSto
     Box::into_raw(Box::new(CandleStore::from_hardware(max_symbols as usize)))
 }
 
-/// # Safety: `ptr` must be a valid pointer returned by `candlestore_new`.
+/// Free a CandleStore previously allocated by `candlestore_new`.
+///
+/// # Safety
+/// `ptr` must be a valid pointer returned by [`candlestore_new`] or
+/// [`candlestore_new_hardware`] that has not been freed yet. Passing a
+/// null pointer is allowed (no-op). Passing the same pointer twice or
+/// any other pointer is undefined behaviour.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn candlestore_free(ptr: *mut CandleStore) {
     if !ptr.is_null() {
@@ -32,8 +38,15 @@ pub unsafe extern "C" fn candlestore_free(ptr: *mut CandleStore) {
 
 // ── write ─────────────────────────────────────────────────────────────────────
 
+/// Append a candle to the store under `symbol`.
+///
 /// Returns 0 on success, -1 on invalid arguments.
-/// # Safety: `ptr` and `symbol` must be valid non-null pointers.
+///
+/// # Safety
+/// `ptr` must be a valid pointer returned by `candlestore_new` and not
+/// yet freed. `symbol` must be a valid, null-terminated UTF-8 C string.
+/// Passing a null `ptr` or null `symbol` returns -1 safely; any other
+/// invalid pointer is undefined behaviour.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn candlestore_append(
     ptr:    *mut CandleStore,
@@ -50,9 +63,15 @@ pub unsafe extern "C" fn candlestore_append(
 
 // ── read ──────────────────────────────────────────────────────────────────────
 
-/// Fills `out[0..return_value]` with matching candles.
+/// Range query — fills `out[0..return_value]` with matching candles.
 /// Returns the number written, or -1 on error.
-/// # Safety: `ptr`, `symbol`, and `out` must be valid; `out` must hold at least `max_len` elements.
+///
+/// # Safety
+/// `ptr` must be a valid pointer returned by `candlestore_new` and not
+/// yet freed. `symbol` must be a valid, null-terminated UTF-8 C string.
+/// `out` must point to a contiguous buffer of at least `max_len` `Candle`
+/// values that is writable for the duration of the call. Any of these
+/// being null returns -1 safely; other invalid pointers are UB.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn candlestore_range(
     ptr:     *const CandleStore,
@@ -76,6 +95,12 @@ pub unsafe extern "C" fn candlestore_range(
 
 // ── metadata ──────────────────────────────────────────────────────────────────
 
+/// Number of symbols currently held in RAM.
+///
+/// # Safety
+/// `ptr` must be a valid pointer returned by `candlestore_new` and not
+/// yet freed. A null pointer returns -1 safely; other invalid pointers
+/// are undefined behaviour.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn candlestore_symbol_count(ptr: *const CandleStore) -> c_int {
     if ptr.is_null() { return -1; }

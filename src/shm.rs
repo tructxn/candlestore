@@ -29,7 +29,7 @@ use crate::Candle;
 
 /// Magic value written to `ShmHeader::ready` once the writer has initialised
 /// the shared-memory segment. The reader spins until it sees this value.
-pub const READY_MAGIC: u64 = 0xCAFE_CA1D_1E5748;
+pub const READY_MAGIC: u64 = 0x00CA_FECA_1D1E_5748;
 
 /// Apple M-series (and many modern x86) cache line = 128 bytes.
 const CACHE_LINE: usize = 128;
@@ -110,8 +110,12 @@ pub struct SpscRing;
 impl SpscRing {
     /// Create a linked writer/reader pair backed by a heap-allocated ring of `capacity` slots.
     ///
+    /// `SpscRing` is a factory namespace (not an instantiable type) — `new`
+    /// returns the producer/consumer halves rather than `Self`.
+    ///
     /// # Panics
     /// Panics if `capacity` is zero or not a power of two.
+    #[allow(clippy::new_ret_no_self)]
     pub fn new<T: Copy + Default + Send>(capacity: usize) -> (SpscWriter<T>, SpscReader<T>) {
         assert!(capacity.is_power_of_two(), "SpscRing capacity must be a power of two");
         assert!(capacity > 0, "SpscRing capacity must be > 0");
@@ -555,7 +559,7 @@ mod shm_impl {
     // ── ShmIngester ──────────────────────────────────────────────────────────
 
     /// Background thread that continuously drains a [`ShmRingReader`] into a
-    /// [`CandleStore`] by calling `store.append(symbol, candle)` on every pop.
+    /// [`crate::CandleStore`] by calling `store.append(symbol, candle)` on every pop.
     ///
     /// The thread spins on `try_pop`. Dropping the ingester (or calling
     /// [`stop`](ShmIngester::stop)) signals the thread to exit and joins it.

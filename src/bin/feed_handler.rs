@@ -211,7 +211,7 @@ fn main() {
             candles_pushed.store(count, Ordering::Relaxed);
         }
 
-        if count % report_every == 0 {
+        if count.is_multiple_of(report_every) {
             let elapsed = last_log_at.elapsed().as_secs_f64();
             let rate_now = (count - last_log_count) as f64 / elapsed;
             info!(count, last_close = close, rate_per_sec = rate_now, "feed progress");

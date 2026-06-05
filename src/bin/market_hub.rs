@@ -7,8 +7,8 @@
 //! Thread layout (each pinned to its own core):
 //!
 //!   core HUB_CORE:      ingester thread   (ShmRingReader → CandleStore)
-//!   core HUB_CORE+1:    strategy thread   (CandleStore → SpscRing<Signal>)
-//!   core HUB_CORE+2:    executor thread   (SpscRing<Signal> → paper trades)
+//!   core HUB_CORE+1:    strategy thread   (CandleStore → `SpscRing<Signal>`)
+//!   core HUB_CORE+2:    executor thread   (`SpscRing<Signal>` → paper trades)
 //!
 //! The strategy is **reactive**: it spins on `CandleStore::wait_for_change`
 //! (an `AtomicU64` version counter the ingester bumps on every append) and
@@ -146,6 +146,10 @@ fn sma(candles: &[Candle], period: usize) -> Option<f64> {
     Some(slice.iter().map(|c| c.close).sum::<f64>() / period as f64)
 }
 
+// The strategy thread is a process-boundary entry. Each parameter is a
+// distinct piece of runtime state with no natural sub-grouping — pushing
+// half of them into a config struct just adds an unwrap site.
+#[allow(clippy::too_many_arguments)]
 fn strategy_thread(
     store:           Arc<CandleStore>,
     shutdown:        Arc<AtomicBool>,
@@ -206,7 +210,7 @@ fn strategy_thread(
                 signal_count += 1;
                 signals_counter.store(signal_count, Ordering::Relaxed);
 
-                if signal_count % report_every == 0 || signal_count <= 5 {
+                if signal_count.is_multiple_of(report_every) || signal_count <= 5 {
                     let uptime = strategy_start.elapsed().as_secs_f64();
                     info!(
                         n = signal_count,
@@ -314,7 +318,7 @@ fn metrics_poller(h: PollerHandles) {
         // Operator alert: a sustained drift in this rate means disk health
         // is degrading — appends are being dropped, not just delayed.
         if store_snap.appends_rejected_total > 0
-            && store_snap.appends_rejected_total % 1000 == 0
+            && store_snap.appends_rejected_total.is_multiple_of(1000)
         {
             warn!(
                 total = store_snap.appends_rejected_total,

@@ -68,8 +68,8 @@ fn main() {
     println!("Physical cores: {}", hw.physical_cores);
     println!("Usable L3 (1/3): {} KB\n", hw.usable_l3_bytes() / 1024);
 
-    println!("{:>10}  {:>10}  {:>10}  {}", "size", "latency", "vs L1", "zone");
-    println!("{}", "─".repeat(54));
+    println!("{:>10}  {:>10}  {:>10}  zone", "size", "latency", "vs L1");
+    println!("{:─<54}", "");
 
     let sizes: &[(usize, &str)] = &[
         (4   * 1024,              "L1"),

@@ -1,8 +1,8 @@
-/// CPU core affinity helpers.
-///
-/// On Linux: uses `sched_setaffinity` for hard pinning.
-/// On macOS: uses Mach thread affinity tags (soft hint — OS honours it but
-///           does not strictly guarantee the thread stays on one core).
+//! CPU core affinity helpers.
+//!
+//! On Linux: uses `sched_setaffinity` for hard pinning.
+//! On macOS: uses Mach thread affinity tags (soft hint — OS honours it but
+//!           does not strictly guarantee the thread stays on one core).
 
 /// Pin the calling thread to `core_id`. Returns `true` on success.
 ///

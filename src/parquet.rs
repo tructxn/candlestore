@@ -251,8 +251,10 @@ pub fn query_cold(data_dir: &Path, symbol: &str, from_ts: i64, to_ts: i64) -> Ve
         if path.extension().and_then(|e| e.to_str()) != Some("parquet") { continue; }
 
         // skip files whose ts range doesn't overlap with [from_ts, to_ts]
-        if let Some((file_start, file_end)) = parse_ts_range(&path) {
-            if file_end < from_ts || file_start > to_ts { continue; }
+        if let Some((file_start, file_end)) = parse_ts_range(&path)
+            && (file_end < from_ts || file_start > to_ts)
+        {
+            continue;
         }
 
         match read_file(&path) {

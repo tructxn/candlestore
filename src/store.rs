@@ -39,8 +39,8 @@ struct Entry {
 ///
 /// # Observability
 ///
-/// Internal atomic counters track lifetime totals for appends (via [`version`]
-/// (Self::version)), evictions, and Parquet spill outcomes. Cheap to update
+/// Internal atomic counters track lifetime totals for appends (via
+/// [`version`](Self::version)), evictions, and Parquet spill outcomes. Cheap to update
 /// (single `fetch_add`) so the hot path stays sub-microsecond. The application
 /// reads these via [`snapshot`](Self::snapshot) on a low-frequency timer (e.g.
 /// every second) and feeds them to its metrics pipeline; the library itself

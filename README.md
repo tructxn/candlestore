@@ -1,5 +1,7 @@
 # candlestore
 
+[![CI](https://github.com/tructxn/candlestore/actions/workflows/ci.yml/badge.svg)](https://github.com/tructxn/candlestore/actions/workflows/ci.yml)
+
 A trading system kernel written in Rust. Lock-free SPSC rings carry market data
 from exchange feed handlers to a hardware-tuned time-series store, then signals
 from a strategy engine to an order executor. Each component runs on a dedicated

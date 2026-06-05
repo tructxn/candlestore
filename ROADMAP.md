@@ -211,6 +211,20 @@ Run in two terminals:
 - [x] 5 s timeout on thread joins with `is_finished()` poll — detach-with-
       warning if a worker misses the shutdown flag
 
+### 10.8 CI pipeline ✅
+- [x] `.github/workflows/ci.yml` running on push to `main` and on every PR
+- [x] Matrix: ubuntu-latest + macos-latest (the deploy + dev OSes)
+- [x] `cargo build --release --all-targets` + `cargo test --release`
+      + `cargo build --release --features feed`
+- [x] `cargo clippy --release --all-targets --no-deps -- -D warnings` — fails
+      the build on any new lint
+- [x] `cargo doc --no-deps --all-features` with `RUSTDOCFLAGS="-D warnings"`
+      — broken intra-doc links fail the build
+- [x] `rustsec/audit-check` — RustSec advisory database scan on every PR
+- [x] `Swatinem/rust-cache@v2` — sub-minute warm cache hits
+- [x] Cleared all 16 pre-existing clippy warnings + broken rustdoc links
+      as part of bring-up
+
 ### 10.7 Parquet schema versioning ✅
 - [x] `pub const SCHEMA_VERSION: u32 = 1` embedded in Arrow schema metadata
       (`candlestore.brand` + `candlestore.schema_version`)
