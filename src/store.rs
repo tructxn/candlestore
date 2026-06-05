@@ -76,3 +76,53 @@ impl CandleStore {
         self.inner.read().symbols.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Candle;
+
+    fn candle(ts: i64) -> Candle {
+        Candle { ts, open: 1.0, high: 1.0, low: 1.0, close: 1.0, volume: 1.0 }
+    }
+
+    #[test]
+    fn append_and_range_basic() {
+        let store = CandleStore::new(10);
+        store.append("BTC/USDT:1m", candle(100));
+        store.append("BTC/USDT:1m", candle(200));
+        store.append("BTC/USDT:1m", candle(300));
+        let out = store.range("BTC/USDT:1m", 100, 200);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn unknown_symbol_returns_empty() {
+        let store = CandleStore::new(10);
+        assert!(store.range("ETH/USDT:1m", 0, 9999).is_empty());
+    }
+
+    #[test]
+    fn lru_evicts_least_recently_used() {
+        let store = CandleStore::new(2); // only 2 symbols fit
+        store.append("A", candle(1));
+        store.append("B", candle(2));
+        // access A again to make B the LRU
+        store.append("A", candle(3));
+        // adding C should evict B
+        store.append("C", candle(4));
+        assert_eq!(store.symbol_count(), 2);
+        assert!(store.range("B", 0, 9999).is_empty()); // B evicted
+        assert!(!store.range("A", 0, 9999).is_empty());
+        assert!(!store.range("C", 0, 9999).is_empty());
+    }
+
+    #[test]
+    fn multiple_symbols_independent() {
+        let store = CandleStore::new(10);
+        store.append("BTC/USDT:1m", candle(1));
+        store.append("ETH/USDT:1m", candle(2));
+        assert_eq!(store.range("BTC/USDT:1m", 0, 9999).len(), 1);
+        assert_eq!(store.range("ETH/USDT:1m", 0, 9999).len(), 1);
+    }
+}
