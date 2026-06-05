@@ -5,9 +5,13 @@ All numbers measured on Apple M-series (10 physical cores, 4 MB L3 cache), relea
 ```
 cargo bench                            # run all benchmarks
 cargo bench --bench design_decisions   # architectural decisions only
+cargo run --release --example cache_ladder  # memory hierarchy visualiser
 ```
 
 Criterion HTML reports are generated in `target/criterion/`.
+
+**Reference**: Ulrich Drepper, "What Every Programmer Should Know About Memory", Red Hat 2007.
+`akkadia.org/drepper/cpumemory.pdf` — §3 covers cache hierarchy measurement methodology.
 
 ---
 
@@ -198,6 +202,24 @@ second under peak load.
 ---
 
 ### Decision 3 — L3-fit ring capacity vs overflow
+
+> **Visualise the hierarchy yourself**: `cargo run --release --example cache_ladder`
+> uses pointer chasing (Drepper §3.3) to measure random-access latency at each
+> cache level on your actual hardware. Sample output on M-series:
+>
+> ```
+>      4 KB    2.2 ns    1.0×  L1
+>     16 KB    1.3 ns    0.6×  L1
+>    256 KB    5.5 ns    2.5×  L2
+>      1 MB    5.1 ns    2.3×  L3 (candlestore) ◄
+>      4 MB    8.7 ns    4.0×  L3 ceiling
+>      8 MB   26.5 ns   12.1×  L3 overflow
+>     32 MB  117.5 ns   53.7×  DRAM
+> ```
+>
+> DRAM is **23× slower** than L3 for random access — same ratio as the hot vs cold
+> Parquet benchmark (Decision 5). The pointer-chase result and the store benchmark
+> are measuring the same physical phenomenon from two different angles.
 
 **Hypothesis**: Sizing ring capacity to fit in the usable portion of L3
 (`usable_L3 / max_symbols`) keeps hot candle data in cache and speeds range scans.
