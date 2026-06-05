@@ -308,6 +308,62 @@ per-symbol window proportionally without overflowing cache.
 
 ---
 
+## Suite 3: IPC Comparison (`ipc_comparison.rs`)
+
+In-process latency is bounded by cache speed. Cross-process latency depends on the
+communication mechanism. This suite compares two options:
+
+- **SPSC ring** (lock-free, shared memory between two OS threads)
+- **`std::sync::mpsc`** (lock-based, OS-assisted handoff)
+
+Both are same-process here; the SHM ring (`shm.rs`) extends this to cross-process.
+
+### Throughput (1M messages, ring cap=1024)
+
+Small ring capacity forces the writer to block when full — both sides run
+concurrently. This is the realistic workload SPSC was built for.
+
+| Channel             | Total time  | Throughput      |
+|---------------------|-------------|-----------------|
+| spsc_ring (cap=1024)| 35.72 ms    | **28.0M msg/s** |
+| mpsc_channel        | 17.28 ms    | **57.9M msg/s** |
+
+**mpsc wins throughput 2×.** The reason is counter-intuitive: `mpsc::channel` has no
+capacity limit. The writer never stalls — it enqueues all 1M messages ahead of the
+reader. The SPSC ring with cap=1024 forces a synchronization point every 1,024 messages,
+adding coordination overhead. For pure bulk throughput with no back-pressure, mpsc's
+unbounded queue wins.
+
+### Latency (rendezvous, per-message)
+
+Fair comparison: SPSC capacity=1 (writer blocks after every push) vs `sync_channel(0)`
+(sender blocks until receiver takes the value). Both are true one-at-a-time handoff.
+
+| Channel                   | Latency per handoff | Confidence interval  |
+|---------------------------|---------------------|----------------------|
+| spsc_ring (cap=1, ring)   | **76.7 ns**         | [76.3, 77.1] ns      |
+| mpsc sync_channel(0)      | **1,300 ns**        | [1.3, 1.3] µs        |
+| **SPSC advantage**        | **17×**             |                      |
+
+**SPSC wins latency 17×.** mpsc requires OS kernel involvement on every handoff:
+`sync_channel(0)` is backed by a futex — writer parks (syscall), reader wakes it
+(syscall). Two syscalls × ~650 ns each ≈ 1.3 µs. SPSC ring uses only atomic CAS
+operations — no kernel, no context switch, ~77 ns per message.
+
+### When to use which
+
+| Scenario                                   | Choice     |
+|--------------------------------------------|------------|
+| Market data tick delivery, latency-critical | SPSC ring |
+| Bulk batch transfer, back-pressure OK       | mpsc       |
+| Cross-process (producer and consumer PIDs differ) | SHM SPSC (`ShmRingWriter`) |
+
+The cross-process SHM ring (`examples/shm_writer` + `examples/shm_reader`) extends
+the in-process SPSC ring to two separate processes. The kernel manages page-table
+mappings to the same physical RAM; the SPSC atomic protocol is identical.
+
+---
+
 ## Summary
 
 | Decision                     | Verdict    | Measured impact                          |
@@ -317,3 +373,5 @@ per-symbol window proportionally without overflowing cache.
 | L3-fit ring capacity         | Confirmed  | 60–71× faster range scan                 |
 | parking_lot vs std RwLock    | Confirmed  | 27% lower acquisition latency            |
 | LRU eviction to Parquet      | Confirmed  | 23× cold miss penalty → size correctly   |
+| SPSC ring vs mpsc (latency)  | Confirmed  | 17× lower latency (77 ns vs 1.3 µs)     |
+| SPSC ring vs mpsc (throughput)| Note      | mpsc 2× faster bulk (no back-pressure)  |

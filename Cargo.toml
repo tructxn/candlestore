@@ -53,9 +53,19 @@ harness = false
 name    = "design_decisions"
 harness = false
 
+[[bench]]
+name    = "ipc_comparison"
+harness = false
+
 [[example]]
 name              = "binance_feed"
 required-features = ["feed"]
 
 [[example]]
 name = "hw_probe"
+
+[[example]]
+name = "shm_writer"
+
+[[example]]
+name = "shm_reader"
