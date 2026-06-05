@@ -28,14 +28,14 @@ Hot data in RAM, cold data spilled to Parquet. No server, no GC, no SQL overhead
 
 ---
 
-## Phase 3 — Parquet Cold Storage 🔲
+## Phase 3 — Parquet Cold Storage ✅
 > Evicted symbols spill to disk. Cold reads load back into RAM.
 
-- [ ] Write evicted `RingBuffer` to `{data_dir}/{symbol}/{ts_start}-{ts_end}.parquet`
-- [ ] Read cold Parquet file back on cache miss
-- [ ] Merge hot (RAM) + cold (Parquet) results in `range()` query
-- [ ] Configurable `data_dir` on `CandleStore::new()`
-- [ ] Tests — evict → spill → reload → verify data integrity
+- [x] Write evicted `RingBuffer` to `{data_dir}/{symbol}/{ts_start}_{ts_end}.parquet`
+- [x] Read cold Parquet file back on cache miss
+- [x] Merge hot (RAM) + cold (Parquet) results in `range()` query
+- [x] `CandleStore::with_data_dir(path)` builder method
+- [x] Tests — evict → spill → reload → verify data integrity (6 parquet tests)
 - [ ] Benchmark — cold read latency vs hot read latency
 
 ---
