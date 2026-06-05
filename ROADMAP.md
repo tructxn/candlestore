@@ -16,7 +16,19 @@ Hot data in RAM, cold data spilled to Parquet. No server, no GC, no SQL overhead
 
 ---
 
-## Phase 2 — Parquet Cold Storage 🔲
+## Phase 2 — Hardware-Aware Configuration 🔲
+> Auto-tune ring buffer capacity and struct layout based on the host machine.
+
+- [ ] `HardwareProfile::detect()` — read L3 cache size, cache line size, physical core count
+- [ ] `CandleStore::from_hardware(max_symbols)` — derive optimal `ring_capacity` from L3 / symbols / `size_of::<Candle>()`
+- [ ] Adaptive `Candle` packing — 1 candle/cache-line on x86 (64B), 2 candles/cache-line on Apple M-series (128B)
+- [ ] Expose `HardwareProfile` in public API so callers can inspect detected values
+- [ ] Benchmark — compare auto-tuned vs static defaults on different machines
+- [ ] Document: "why your ring buffer capacity should match your L3 cache"
+
+---
+
+## Phase 3 — Parquet Cold Storage 🔲
 > Evicted symbols spill to disk. Cold reads load back into RAM.
 
 - [ ] Write evicted `RingBuffer` to `{data_dir}/{symbol}/{ts_start}-{ts_end}.parquet`
@@ -28,7 +40,7 @@ Hot data in RAM, cold data spilled to Parquet. No server, no GC, no SQL overhead
 
 ---
 
-## Phase 3 — Binance WebSocket Feed 🔲
+## Phase 4 — Binance WebSocket Feed 🔲
 > Populate the store with real BTC/USDT candle data.
 
 - [ ] Connect to Binance public WebSocket kline stream
@@ -40,7 +52,7 @@ Hot data in RAM, cold data spilled to Parquet. No server, no GC, no SQL overhead
 
 ---
 
-## Phase 4 — Matching Engine (Paper Trading) 🔲
+## Phase 5 — Matching Engine (Paper Trading) 🔲
 > Order book on top of the store. Paper trade against real market data.
 
 - [ ] `OrderBook` — price-time priority, bid/ask sides
@@ -52,7 +64,7 @@ Hot data in RAM, cold data spilled to Parquet. No server, no GC, no SQL overhead
 
 ---
 
-## Phase 5 — Go Client 🔲
+## Phase 6 — Go Client 🔲
 > Thin Go wrapper over the Rust library via FFI / C ABI.
 
 - [ ] Expose C ABI from Rust (`#[no_mangle]`, `extern "C"`)
@@ -63,7 +75,7 @@ Hot data in RAM, cold data spilled to Parquet. No server, no GC, no SQL overhead
 
 ---
 
-## Phase 6 — Benchmarks vs QuestDB / InfluxDB 🔲
+## Phase 7 — Benchmarks vs QuestDB / InfluxDB 🔲
 > Prove the design is faster for this specific use case.
 
 - [ ] Equivalent benchmark against QuestDB (same data, same queries)
