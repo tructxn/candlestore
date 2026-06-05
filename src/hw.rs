@@ -85,12 +85,10 @@ fn detect_l3_cache() -> usize {
         if let (Ok(level), Ok(size_str)) = (
             std::fs::read_to_string(&level_path),
             std::fs::read_to_string(&size_path),
-        ) {
-            if level.trim() == "3" {
-                if let Some(bytes) = parse_cache_size(size_str.trim()) {
-                    return bytes;
-                }
-            }
+        ) && level.trim() == "3"
+            && let Some(bytes) = parse_cache_size(size_str.trim())
+        {
+            return bytes;
         }
     }
     default_l3()

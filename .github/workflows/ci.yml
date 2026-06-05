@@ -63,11 +63,24 @@ jobs:
         run: cargo doc --no-deps --all-features
 
   # ── 4. Security advisory scan ─────────────────────────────────────────────
+  # We run `cargo audit` directly rather than via rustsec/audit-check@v2 for
+  # two reasons:
+  #   1. The action treats informational warnings (e.g. "crate X is now
+  #      unmaintained") as failures. Plain `cargo audit` only fails on real
+  #      vulnerabilities, which is what we actually want to gate on.
+  #   2. The action posts a GitHub Check Run via the API, which fails with
+  #      "Resource not accessible by integration" on default-permission
+  #      tokens. The direct CLI avoids that whole class of problem.
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit
+        # Default behaviour: fail on vulnerabilities; print but don't fail on
+        # informational (unmaintained / unsound / notice) advisories.
+        run: cargo audit
