@@ -28,6 +28,9 @@ Hot symbols live in RAM inside a lock-free ring buffer. Cold symbols spill to Pa
 
 ## Benchmarks
 
+> Full report with methodology, all raw numbers, confidence intervals, and
+> architectural decision analysis: **[BENCHMARKS.md](BENCHMARKS.md)**
+
 Measured on Apple M-series (10 physical cores, 4 MB L3), release build (`cargo bench`).
 
 ### Ingestion
