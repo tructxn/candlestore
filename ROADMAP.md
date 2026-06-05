@@ -53,15 +53,16 @@ Hot data in RAM, cold data spilled to Parquet. No server, no GC, no SQL overhead
 
 ---
 
-## Phase 5 — Matching Engine (Paper Trading) 🔲
+## Phase 5 — Matching Engine (Paper Trading) ✅
 > Order book on top of the store. Paper trade against real market data.
 
-- [ ] `OrderBook` — price-time priority, bid/ask sides
-- [ ] Order types: Limit, Market, IOC, FOK
-- [ ] Match engine loop — consume candle feed, match pending orders
-- [ ] Trade event output — fills, cancels, partial fills
-- [ ] Portfolio tracker — positions, PnL, cash balance
-- [ ] Example strategy: simple moving average crossover
+- [x] `OrderBook` — price-time priority, bid/ask sides (BTreeMap, integer price keys)
+- [x] Order types: Limit, Market, IOC, FOK — all four implemented and tested
+- [x] `PaperEngine` — candle-based fill simulation (market@open, limit@low/high touch)
+- [x] Trade events: Fill, Cancel with CancelReason
+- [x] `Portfolio` — positions, avg cost basis, realized + unrealized P&L
+- [x] Example strategy: SMA(10/20) crossover — `examples/paper_trade.rs`
+- [x] 33 tests passing across all modules
 
 ---
 
