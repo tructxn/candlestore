@@ -80,7 +80,7 @@ fn make_candle(i: usize) -> Candle {
 // We measure the wall-clock time for the reader to consume all N messages.
 
 fn run_spsc_throughput(n: usize) -> Duration {
-    let (w, r): (SpscWriter, SpscReader) = SpscRing::new(RING_CAP);
+    let (w, r): (SpscWriter<Candle>, SpscReader<Candle>) = SpscRing::new(RING_CAP);
     let writer = std::thread::spawn(move || {
         for i in 0..n { w.push(make_candle(i)); }
     });
@@ -147,7 +147,7 @@ fn bench_latency(c: &mut Criterion) {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
                 // capacity=1: writer must wait for reader to pop before next push
-                let (w, r): (SpscWriter, SpscReader) = SpscRing::new(1);
+                let (w, r): (SpscWriter<Candle>, SpscReader<Candle>) = SpscRing::new(1);
                 let writer = std::thread::spawn(move || {
                     for i in 0..N_LATENCY { w.push(make_candle(i)); }
                 });

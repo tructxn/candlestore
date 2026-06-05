@@ -77,8 +77,8 @@ impl CachePadded {
 ///   (i.e., `head - tail < capacity`), and only by the writer.
 /// - `slots[i % capacity]` may only be read when the slot is logically full
 ///   (i.e., `head > tail`), and only by the reader.
-struct SpscInner {
-    slots:    Box<[UnsafeCell<Candle>]>,
+struct SpscInner<T> {
+    slots:    Box<[UnsafeCell<T>]>,
     capacity: usize,
     head:     CachePadded, // producer cursor — written only by writer
     tail:     CachePadded, // consumer cursor — written only by reader
@@ -87,24 +87,24 @@ struct SpscInner {
 /// SAFETY: `SpscWriter` and `SpscReader` each hold a non-overlapping exclusive
 /// role (producer / consumer), enforced at construction time. The `UnsafeCell`
 /// slots are accessed in a non-overlapping manner by the two roles.
-unsafe impl Send for SpscInner {}
-unsafe impl Sync for SpscInner {}
+unsafe impl<T: Send> Send for SpscInner<T> {}
+unsafe impl<T: Send> Sync for SpscInner<T> {}
 
 use std::sync::Arc;
 
-/// Produces candles into a heap-backed SPSC ring buffer.
-pub struct SpscWriter {
-    inner: Arc<SpscInner>,
+/// Produces items into a heap-backed SPSC ring buffer.
+pub struct SpscWriter<T> {
+    inner: Arc<SpscInner<T>>,
 }
 
-/// Consumes candles from a heap-backed SPSC ring buffer.
-pub struct SpscReader {
-    inner: Arc<SpscInner>,
+/// Consumes items from a heap-backed SPSC ring buffer.
+pub struct SpscReader<T> {
+    inner: Arc<SpscInner<T>>,
 }
 
 /// Heap-backed SPSC ring buffer factory.
 ///
-/// `capacity` must be a power of two for efficient index masking.
+/// `T` must be `Copy + Default + Send`. `capacity` must be a power of two.
 pub struct SpscRing;
 
 impl SpscRing {
@@ -112,13 +112,12 @@ impl SpscRing {
     ///
     /// # Panics
     /// Panics if `capacity` is zero or not a power of two.
-    pub fn new(capacity: usize) -> (SpscWriter, SpscReader) {
+    pub fn new<T: Copy + Default + Send>(capacity: usize) -> (SpscWriter<T>, SpscReader<T>) {
         assert!(capacity.is_power_of_two(), "SpscRing capacity must be a power of two");
         assert!(capacity > 0, "SpscRing capacity must be > 0");
 
-        let zero = Candle { ts: 0, open: 0.0, high: 0.0, low: 0.0, close: 0.0, volume: 0.0 };
-        let slots: Box<[UnsafeCell<Candle>]> = (0..capacity)
-            .map(|_| UnsafeCell::new(zero))
+        let slots: Box<[UnsafeCell<T>]> = (0..capacity)
+            .map(|_| UnsafeCell::new(T::default()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
@@ -133,23 +132,19 @@ impl SpscRing {
     }
 }
 
-impl SpscWriter {
-    /// Push a candle, spinning until space is available.
+impl<T: Copy> SpscWriter<T> {
+    /// Push an item, spinning until space is available.
     #[inline]
-    pub fn push(&self, candle: Candle) {
+    pub fn push(&self, item: T) {
         loop {
-            if self.try_push(candle) {
-                return;
-            }
+            if self.try_push(item) { return; }
             std::hint::spin_loop();
         }
     }
 
-    /// Try to push a candle without blocking.
-    ///
-    /// Returns `true` if the candle was written, `false` if the ring was full.
+    /// Try to push without blocking. Returns `false` if the ring is full.
     #[inline]
-    pub fn try_push(&self, candle: Candle) -> bool {
+    pub fn try_push(&self, item: T) -> bool {
         let head = self.inner.head.value.load(Ordering::Relaxed);
         let tail = self.inner.tail.value.load(Ordering::Acquire);
 
@@ -161,48 +156,40 @@ impl SpscWriter {
 
         // SAFETY: We verified `head - tail < capacity`, so this slot belongs
         // exclusively to the writer. No reader can access it until we advance head.
-        unsafe {
-            *self.inner.slots[slot].get() = candle;
-        }
+        unsafe { *self.inner.slots[slot].get() = item; }
 
         self.inner.head.value.store(head.wrapping_add(1), Ordering::Release);
         true
     }
 }
 
-impl SpscReader {
-    /// Pop a candle, spinning until one is available.
+impl<T: Copy> SpscReader<T> {
+    /// Pop an item, spinning until one is available.
     #[inline]
-    pub fn pop(&self) -> Candle {
+    pub fn pop(&self) -> T {
         loop {
-            if let Some(c) = self.try_pop() {
-                return c;
-            }
+            if let Some(v) = self.try_pop() { return v; }
             std::hint::spin_loop();
         }
     }
 
-    /// Try to pop a candle without blocking.
-    ///
-    /// Returns `None` if the ring is empty.
+    /// Try to pop without blocking. Returns `None` if the ring is empty.
     #[inline]
-    pub fn try_pop(&self) -> Option<Candle> {
+    pub fn try_pop(&self) -> Option<T> {
         let tail = self.inner.tail.value.load(Ordering::Relaxed);
         let head = self.inner.head.value.load(Ordering::Acquire);
 
-        if head == tail {
-            return None; // ring empty
-        }
+        if head == tail { return None; }
 
         let slot = tail as usize & (self.inner.capacity - 1);
 
         // SAFETY: We verified `head > tail`, so this slot was written by the
         // writer and is now exclusively available to the reader. The writer will
         // not touch this slot again until tail advances past capacity slots ahead.
-        let candle = unsafe { *self.inner.slots[slot].get() };
+        let item = unsafe { *self.inner.slots[slot].get() };
 
         self.inner.tail.value.store(tail.wrapping_add(1), Ordering::Release);
-        Some(candle)
+        Some(item)
     }
 }
 
@@ -677,7 +664,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "power of two")]
     fn spsc_non_power_of_two_panics() {
-        let _ = SpscRing::new(3);
+        let _ = SpscRing::new::<Candle>(3);
     }
 
     // ── ShmHeader layout ────────────────────────────────────────────────────

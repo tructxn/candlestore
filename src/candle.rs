@@ -1,5 +1,5 @@
 /// OHLCV candle — 48 bytes, cache-line friendly
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[repr(C)]
 pub struct Candle {
     pub ts:     i64,   // unix timestamp ms

@@ -199,8 +199,9 @@ src/
   parquet.rs      Cold spill to Parquet, range-aware file naming
   hw.rs           Hardware detection (L3, cache line, cores)
   ffi.rs          C ABI for Go/cgo
-  shm.rs          SPSC ring buffers: heap (SpscRing) + POSIX shm (ShmRing*)
-                  ShmIngester — background thread, drains SHM ring into store
+  shm.rs          SpscRing<T> (generic SPSC), POSIX ShmRing*, ShmIngester
+  signal.rs       Signal (64-byte, Copy) + Side — strategy→executor bus type
+  affinity.rs     pin_to_core(): sched_setaffinity (Linux) / Mach tag (macOS)
   matching/       Order book + paper trading engine
     book.rs       Price-time priority (Limit/Market/IOC/FOK)
     paper.rs      Candle-based paper trading simulation
@@ -215,6 +216,19 @@ examples/
   shm_writer.rs      Cross-process SHM writer (5M candles, prints throughput)
   shm_reader.rs      Cross-process SHM reader (reports min/avg/max/p99 latency)
   cache_ladder.rs    Drepper pointer-chase: measure true L1/L2/L3/DRAM latency
+
+src/bin/           Runnable trading system processes
+  feed_handler.rs  Synthetic GBM feed → ShmRingWriter, pinned to core 0
+  market_hub.rs    Ingester + SMA strategy + executor, cores 1-3
+```
+
+**Run the full kernel (two terminals):**
+```bash
+cargo run --release --bin feed_handler   # terminal 1 — feed handler, core 0
+cargo run --release --bin market_hub     # terminal 2 — store + strategy + executor, cores 1-3
+```
+
+```
 include/
   candlestore.h      C header for FFI consumers
 ```

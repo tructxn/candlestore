@@ -89,6 +89,33 @@ Hot data in RAM, cold data spilled to Parquet. No server, no GC, no SQL overhead
 
 ---
 
+## Phase 9 — Trading System Kernel ✅
+> Full multi-process, multi-core trading pipeline with dedicated threads per
+> component and SPSC rings as the inter-component bus.
+
+- [x] `src/signal.rs` — `Signal` (64-byte, `Copy`, `repr(C)`) + `Side` enum
+- [x] `src/affinity.rs` — `pin_to_core(id)` / `available_cores()`:
+      Linux: `sched_setaffinity` (hard pin);
+      macOS: Mach `thread_policy_set` affinity tag (soft hint)
+- [x] `SpscRing<T>` — made generic over `T: Copy + Default + Send`; reused for
+      both `Candle` (feed→store) and `Signal` (strategy→executor) buses
+- [x] `src/bin/feed_handler.rs` — synthetic GBM price generator → ShmRingWriter,
+      pinned to core 0, configurable rate (default 10k candles/sec)
+- [x] `src/bin/market_hub.rs` — three threads:
+      - ingester (core 1): ShmIngester → CandleStore
+      - strategy (core 2): SMA(10/20) crossover → SpscRing<Signal>
+      - executor (core 3): SpscReader<Signal> → paper position tracker
+- [x] End-to-end demo verified: signals flow feed→ring→store→strategy→executor
+- [x] 44 tests passing
+
+```
+Run in two terminals:
+  cargo run --release --bin feed_handler
+  cargo run --release --bin market_hub
+```
+
+---
+
 ## Phase 8 — SHM Ingestion Pipeline ✅
 > Connect the SPSC shared-memory ring to the CandleStore, completing the
 > feed handler → store → strategy data path.
