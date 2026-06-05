@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use hashbrown::HashMap;
 use parking_lot::RwLock;
-use crate::{Candle, ring_buffer::RingBuffer};
+use crate::{Candle, hw::HardwareProfile, ring_buffer::RingBuffer};
 
 const DEFAULT_RING_CAPACITY: usize = 10_000; // ~10k candles hot per symbol
 
@@ -24,12 +24,23 @@ struct Inner {
 
 impl CandleStore {
     pub fn new(max_symbols: usize) -> Self {
+        Self::with_capacity(max_symbols, DEFAULT_RING_CAPACITY)
+    }
+
+    /// Auto-tune ring buffer capacity from detected L3 cache size.
+    pub fn from_hardware(max_symbols: usize) -> Self {
+        let hw = HardwareProfile::detect();
+        let ring_capacity = hw.ring_capacity_for(max_symbols);
+        Self::with_capacity(max_symbols, ring_capacity)
+    }
+
+    pub fn with_capacity(max_symbols: usize, ring_capacity: usize) -> Self {
         Self {
             inner: RwLock::new(Inner {
                 symbols:      HashMap::with_capacity(max_symbols),
                 lru_order:    VecDeque::with_capacity(max_symbols),
                 max_symbols,
-                ring_capacity: DEFAULT_RING_CAPACITY,
+                ring_capacity,
                 tick:         0,
             }),
         }

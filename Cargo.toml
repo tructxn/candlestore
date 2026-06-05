@@ -13,6 +13,13 @@ parking_lot = "0.12"        # faster Mutex/RwLock than std
 arrow = { version = "53", features = ["ipc"] }
 parquet = "53"
 thiserror = "1"
+num_cpus = "1"              # physical core count
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
