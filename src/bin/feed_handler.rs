@@ -36,6 +36,18 @@ fn now_nanos() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64
 }
 
+/// Returns a monotonically non-decreasing timestamp by carrying the previous
+/// value forward when the wall clock jumps backwards (NTP correction).
+///
+/// Without this, the binary-search range queries in CandleStore break — they
+/// assume monotonicity, and an NTP slew that rolls the clock back by a
+/// fraction of a second produces candles the search can't find.
+#[inline]
+fn next_ts(last: i64) -> i64 {
+    let now = now_nanos();
+    if now > last { now } else { last.saturating_add(1) }
+}
+
 /// LCG-based price simulation — no rand dependency needed.
 fn next_price(prev: f64, seed: &mut u64) -> f64 {
     *seed = seed.wrapping_mul(6_364_136_223_846_793_005)
@@ -202,6 +214,8 @@ fn main() {
     let mut price = 50_000.0_f64;
     let mut seed  = 0xDEAD_BEEF_1234_5678u64;
     let mut count = 0u64;
+    let mut last_ts: i64 = 0;
+    let mut clock_skew_corrections: u64 = 0;
     let mut next_tick = Instant::now();
     let report_every = (rate * 5) as u64; // info log every 5 seconds
     let mut last_log_count = 0u64;
@@ -230,7 +244,20 @@ fn main() {
         let volume = 0.5 + r1 * 2.0;
         price = close;
 
-        let candle = Candle { ts: now_nanos(), open, high, low, close, volume };
+        // Monotonic ts: never let the wall clock roll candles backwards
+        // (NTP correction breaks binary-search range queries downstream).
+        let raw = now_nanos();
+        let ts  = next_ts(last_ts);
+        if raw <= last_ts {
+            clock_skew_corrections += 1;
+            if clock_skew_corrections == 1 || clock_skew_corrections.is_multiple_of(100) {
+                warn!(raw_now = raw, last_ts, corrected_to = ts, total = clock_skew_corrections,
+                    "clock jumped backwards — applied monotonic correction");
+            }
+        }
+        last_ts = ts;
+
+        let candle = Candle { ts, open, high, low, close, volume };
         if !writer.push_until(candle, &shutdown) {
             // Shutdown signal observed while waiting for ring space — exit
             // the hot loop and let the graceful-shutdown block below run.

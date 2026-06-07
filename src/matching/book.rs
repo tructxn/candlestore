@@ -1,11 +1,68 @@
 use std::collections::{BTreeMap, VecDeque};
+use thiserror::Error;
 use super::{
     event::{CancelReason, Fill, TradeEvent},
     order::{Order, OrderType, Side},
 };
 
-fn price_key(p: f64) -> u64  { (p * 1e8).round() as u64 }
-fn key_price(k: u64)  -> f64 { k as f64 / 1e8 }
+/// Errors from order-book operations that cannot be carried as a Cancel event.
+///
+/// These are *programming/data* errors (bad input) rather than market events
+/// (no fill). The fire-and-forget [`OrderBook::submit`] surfaces them as
+/// `CancelReason::InvalidOrder`; strict callers should use [`OrderBook::try_submit`]
+/// to receive the precise variant.
+#[derive(Debug, Clone, Copy, PartialEq, Error)]
+pub enum BookError {
+    /// Price was NaN or Infinity.
+    #[error("price is not finite")]
+    PriceNotFinite,
+    /// Price was negative or zero (note: zero is technically valid for some
+    /// instruments but the book uses it as the "market order" sentinel).
+    #[error("price must be > 0, got {0}")]
+    PriceNonPositive(f64),
+    /// Price exceeded the representable range for the fixed-point u64 key.
+    /// We multiply by 1e8 (8-decimal precision) so the maximum representable
+    /// price is `u64::MAX / 1e8 ≈ 1.84e11`. Crypto prices are nowhere near
+    /// this; if you see this error, either the input is bad or the
+    /// instrument needs different precision.
+    #[error("price {0} exceeds maximum representable ({MAX_PRICE})")]
+    PriceOutOfRange(f64),
+    /// Quantity was NaN, Infinity, negative, or zero.
+    #[error("quantity must be finite and > 0, got {0}")]
+    QuantityInvalid(f64),
+}
+
+/// Decimal precision of the integer price key. `(price * PRICE_SCALE).round() as u64`.
+const PRICE_SCALE: f64 = 1e8;
+/// Largest price representable as a u64 key without saturating.
+/// `u64::MAX / 1e8 ≈ 1.844e11`.
+pub const MAX_PRICE: f64 = (u64::MAX as f64) / PRICE_SCALE;
+
+/// Convert a floating-point price to the BTreeMap key with full bounds
+/// checking. Replaces the old `(p * 1e8).round() as u64` which silently
+/// saturated to `u64::MAX` for prices over ~92 billion and was undefined
+/// for NaN/Infinity.
+fn try_price_key(p: f64) -> Result<u64, BookError> {
+    if !p.is_finite() {
+        return Err(BookError::PriceNotFinite);
+    }
+    if p <= 0.0 {
+        return Err(BookError::PriceNonPositive(p));
+    }
+    if p > MAX_PRICE {
+        return Err(BookError::PriceOutOfRange(p));
+    }
+    Ok((p * PRICE_SCALE).round() as u64)
+}
+
+/// Infallible variant for code paths that have already validated. Panics if
+/// the input would fail [`try_price_key`] — only use in internal positions
+/// where we KNOW the price came from a validated source.
+fn price_key(p: f64) -> u64 {
+    try_price_key(p).expect("internal: price_key called with unvalidated input")
+}
+
+fn key_price(k: u64) -> f64 { k as f64 / PRICE_SCALE }
 
 /// Price-time priority order book for one symbol.
 pub struct OrderBook {
@@ -19,8 +76,47 @@ impl OrderBook {
         Self { symbol: symbol.into(), bids: BTreeMap::new(), asks: BTreeMap::new() }
     }
 
-    /// Submit an order. Returns all trade events generated (fills + cancels).
-    pub fn submit(&mut self, mut order: Order, ts: i64) -> Vec<TradeEvent> {
+    /// Validate that an order's price (if priced) and quantity are
+    /// representable. Quoted price = `0.0` is allowed for market orders
+    /// (the convention) but otherwise the price must pass [`try_price_key`].
+    fn validate_order(&self, order: &Order) -> Result<(), BookError> {
+        if !order.qty.is_finite() || order.qty <= 0.0 {
+            return Err(BookError::QuantityInvalid(order.qty));
+        }
+        if let Some(p) = order.price {
+            // For market orders, price is None — skipped here.
+            try_price_key(p)?;
+        }
+        Ok(())
+    }
+
+    /// Strict submit. Returns `Err(BookError)` on invalid input (NaN/Inf,
+    /// negative, out of range). On success returns the trade events as
+    /// usual. Prefer this anywhere the order comes from untrusted input —
+    /// strategy outputs, FFI, user submissions.
+    pub fn try_submit(&mut self, order: Order, ts: i64) -> Result<Vec<TradeEvent>, BookError> {
+        self.validate_order(&order)?;
+        Ok(self.submit_validated(order, ts))
+    }
+
+    /// Fire-and-forget submit. Validates first; on invalid input emits
+    /// `CancelReason::InvalidOrder` + `tracing::error!` (with the precise
+    /// `BookError` variant in the log) rather than panicking. Existing
+    /// callers (tests, internal demos) keep working but get the safety net.
+    pub fn submit(&mut self, order: Order, ts: i64) -> Vec<TradeEvent> {
+        if let Err(e) = self.validate_order(&order) {
+            tracing::error!(order_id = order.id, symbol = %self.symbol, error = %e,
+                "order rejected at submit — invalid price or quantity");
+            return vec![TradeEvent::Cancel {
+                order_id: order.id,
+                reason:   CancelReason::InvalidOrder,
+            }];
+        }
+        self.submit_validated(order, ts)
+    }
+
+    /// Internal matching path, called after validation has succeeded.
+    fn submit_validated(&mut self, mut order: Order, ts: i64) -> Vec<TradeEvent> {
         let mut events = Vec::new();
 
         match order.kind {
@@ -214,5 +310,72 @@ mod tests {
         }).collect();
         // maker fill should be order 1 (FIFO)
         assert!(fills.contains(&1));
+    }
+
+    // ── price-quantization safety ──────────────────────────────────────────
+
+    #[test]
+    fn try_price_key_accepts_typical_crypto_prices() {
+        assert!(try_price_key(50_000.0).is_ok());
+        assert!(try_price_key(0.000_000_01).is_ok()); // 1 satoshi
+        assert!(try_price_key(MAX_PRICE).is_ok());
+    }
+
+    #[test]
+    fn try_price_key_rejects_nan() {
+        assert_eq!(try_price_key(f64::NAN), Err(BookError::PriceNotFinite));
+    }
+
+    #[test]
+    fn try_price_key_rejects_infinity() {
+        assert_eq!(try_price_key(f64::INFINITY), Err(BookError::PriceNotFinite));
+        assert_eq!(try_price_key(f64::NEG_INFINITY), Err(BookError::PriceNotFinite));
+    }
+
+    #[test]
+    fn try_price_key_rejects_zero_or_negative() {
+        assert!(matches!(try_price_key(0.0), Err(BookError::PriceNonPositive(_))));
+        assert!(matches!(try_price_key(-1.0), Err(BookError::PriceNonPositive(_))));
+    }
+
+    #[test]
+    fn try_price_key_rejects_overflow() {
+        // 1e15 * 1e8 = 1e23 > u64::MAX → would saturate silently in the old impl.
+        assert!(matches!(try_price_key(1e15), Err(BookError::PriceOutOfRange(_))));
+    }
+
+    #[test]
+    fn try_submit_returns_err_for_nan_price() {
+        let mut book = OrderBook::new("BTC");
+        let bad = Order::limit(1, "BTC", Side::Buy, f64::NAN, 1.0, 0);
+        match book.try_submit(bad, 0) {
+            Err(BookError::PriceNotFinite) => {}
+            other => panic!("expected PriceNotFinite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_submit_returns_err_for_zero_qty() {
+        let mut book = OrderBook::new("BTC");
+        let bad = Order::limit(1, "BTC", Side::Buy, 100.0, 0.0, 0);
+        assert!(matches!(book.try_submit(bad, 0), Err(BookError::QuantityInvalid(_))));
+    }
+
+    #[test]
+    fn submit_emits_invalid_order_cancel_instead_of_panic() {
+        // The fire-and-forget submit() must not panic on bad input.
+        // The old `(p * 1e8).round() as u64` for NaN was undefined behaviour
+        // bordering on saturation; for negative it wrapped silently. This
+        // test pins down the new safety net.
+        let mut book = OrderBook::new("BTC");
+        let bad = Order::limit(1, "BTC", Side::Buy, f64::NAN, 1.0, 0);
+        let events = book.submit(bad, 0);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            TradeEvent::Cancel { reason: CancelReason::InvalidOrder, order_id } => {
+                assert_eq!(*order_id, 1);
+            }
+            other => panic!("expected InvalidOrder cancel, got {other:?}"),
+        }
     }
 }

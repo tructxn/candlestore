@@ -11,7 +11,19 @@ pub struct Fill {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CancelReason { IocRemainder, FokNoFill, MarketNoLiquidity }
+pub enum CancelReason {
+    /// IOC order had remaining unfilled qty after matching.
+    IocRemainder,
+    /// FOK order could not be fully filled at submission time.
+    FokNoFill,
+    /// Market order ran out of opposing liquidity.
+    MarketNoLiquidity,
+    /// Order was rejected before matching because its price/qty failed
+    /// validation (NaN/Inf, negative, out of representable range, etc.).
+    /// See [`BookError`](super::book::BookError) for the variant detail
+    /// that the caller of `try_submit` receives directly.
+    InvalidOrder,
+}
 
 #[derive(Debug, Clone)]
 pub enum TradeEvent {
