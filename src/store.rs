@@ -1036,4 +1036,102 @@ mod tests {
         assert_eq!(snap.out_of_order_total, 1);
         assert_eq!(snap.appends_total, 3);
     }
+
+    // ── Phase 11.7: snapshot determinism ──────────────────────────────────
+
+    #[test]
+    fn snapshot_reflects_initial_state_correctly() {
+        let store = CandleStore::with_capacity(8, 1024);
+        let snap = store.snapshot();
+        assert_eq!(snap.appends_total, 0);
+        assert_eq!(snap.symbol_count, 0);
+        assert_eq!(snap.max_symbols, 8);
+        assert_eq!(snap.ring_capacity, 1024);
+        assert_eq!(snap.evictions_total, 0);
+        assert_eq!(snap.parquet_spill_bytes_total, 0);
+        assert_eq!(snap.parquet_spill_errors_total, 0);
+        assert_eq!(snap.appends_rejected_total, 0);
+        assert_eq!(snap.invalid_candles_total, 0);
+        assert_eq!(snap.out_of_order_total, 0);
+    }
+
+    #[test]
+    fn snapshot_monotonically_tracks_appends_and_symbol_count() {
+        let store = CandleStore::new(10);
+        for i in 1..=5i64 { store.append("BTC", candle(i)); }
+        for i in 1..=3i64 { store.append("ETH", candle(i)); }
+        let snap = store.snapshot();
+        assert_eq!(snap.appends_total, 8);
+        assert_eq!(snap.symbol_count, 2);
+        assert_eq!(snap.evictions_total, 0);
+    }
+
+    #[test]
+    fn snapshot_tracks_eviction_after_capacity_pressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CandleStore::new(1).with_data_dir(dir.path());
+        store.append("BTC", candle(1));
+        store.append("BTC", candle(2));
+        // ETH triggers eviction of BTC
+        store.append("ETH", candle(3));
+
+        let snap = store.snapshot();
+        assert_eq!(snap.evictions_total, 1);
+        assert!(snap.parquet_spill_bytes_total > 0,
+            "BTC's 2 candles must have spilled to parquet");
+        assert_eq!(snap.parquet_spill_errors_total, 0);
+        assert_eq!(snap.appends_total, 3, "every append (even ones causing evict) counts");
+    }
+
+    #[test]
+    fn snapshot_captures_invalid_and_out_of_order_simultaneously() {
+        let store = CandleStore::new(4);
+        store.append("BTC", candle(10));
+        store.append("BTC", candle(20));
+        // Invalid: NaN close
+        let mut bad = candle(30);
+        bad.close = f64::NAN;
+        store.append("BTC", bad);
+        // Out of order: ts=15 after ts=20
+        store.append("BTC", candle(15));
+
+        let snap = store.snapshot();
+        assert_eq!(snap.invalid_candles_total, 1);
+        assert_eq!(snap.out_of_order_total, 1);
+        assert_eq!(snap.appends_total, 3, "the NaN one didn't bump version");
+        assert_eq!(snap.symbol_count, 1);
+    }
+
+    #[test]
+    fn snapshot_is_safe_under_concurrent_writers() {
+        // The poller thread snapshots while writers append. The snapshot
+        // must always be a coherent observation — never a torn read.
+        let store = Arc::new(CandleStore::new(4));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let s = Arc::clone(&store);
+        let st = Arc::clone(&stop);
+        let writer = std::thread::spawn(move || {
+            let mut i = 0i64;
+            while !st.load(Ordering::Relaxed) {
+                s.append("BTC", candle(i)); i += 1;
+            }
+        });
+
+        // 50 quick snapshots while the writer runs.
+        let mut last_total = 0u64;
+        for _ in 0..50 {
+            let snap = store.snapshot();
+            assert!(
+                snap.appends_total >= last_total,
+                "appends_total must be monotonic across snapshots: {} → {}",
+                last_total, snap.appends_total
+            );
+            last_total = snap.appends_total;
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+    }
 }

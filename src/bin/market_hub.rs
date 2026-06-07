@@ -132,6 +132,12 @@ fn describe_all_metrics() {
         "candlestore_executor_signals_total",
         "Lifetime signals consumed by the paper executor."
     );
+    metrics::describe_counter!(
+        "candlestore_signals_rejected_total",
+        "Lifetime signals REJECTED by the executor's risk gate. Buckets: \
+         InvalidQty (qty <= 0 / NaN / over max), PositionLimitExceeded, \
+         RateLimitExceeded. Tune via RISK_MAX_* env vars."
+    );
     metrics::describe_gauge!(
         "candlestore_executor_position",
         "Current paper position (positive = long, negative = short)."
@@ -238,31 +244,119 @@ fn strategy_thread(
 
 // ── Paper executor ──────────────────────────────────────────────────────────
 
+/// Configurable risk gates applied to every signal before it modifies
+/// position. Q5 from the deep review — without these, a buggy strategy
+/// can pump arbitrary qty into the executor and run position to ±∞.
+#[derive(Debug, Clone, Copy)]
+struct RiskGates {
+    /// Reject the signal if `|position + delta| > max_abs_position`.
+    max_abs_position:   f64,
+    /// Reject if `qty <= 0`, `qty > max_qty_per_signal`, or non-finite.
+    max_qty_per_signal: f64,
+    /// Reject if more than `max_signals_per_sec` accepted signals have
+    /// landed in the last 1 s. Defends against runaway strategy loops.
+    max_signals_per_sec: u64,
+}
+
+impl RiskGates {
+    fn from_env() -> Self {
+        Self {
+            max_abs_position:    env_f64("RISK_MAX_ABS_POSITION",   100.0),
+            max_qty_per_signal:  env_f64("RISK_MAX_QTY_PER_SIGNAL", 10.0),
+            max_signals_per_sec: env_usize("RISK_MAX_SIGNALS_PER_SEC", 1000) as u64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RiskRejection {
+    InvalidQty,
+    PositionLimitExceeded,
+    RateLimitExceeded,
+}
+
+/// Stateful rate-limit window — counts accepted signals in the current
+/// 1 s bucket and rolls over.
+struct RateLimiter {
+    bucket_start: Instant,
+    count:        u64,
+    max:          u64,
+}
+impl RateLimiter {
+    fn new(max: u64) -> Self { Self { bucket_start: Instant::now(), count: 0, max } }
+    fn try_accept(&mut self) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.bucket_start) >= Duration::from_secs(1) {
+            self.bucket_start = now;
+            self.count = 0;
+        }
+        if self.count >= self.max { return false; }
+        self.count += 1;
+        true
+    }
+}
+
+fn check_risk(
+    sig:      &Signal,
+    position: f64,
+    delta:    f64,
+    gates:    &RiskGates,
+    rate:     &mut RateLimiter,
+) -> Result<(), RiskRejection> {
+    if !sig.qty.is_finite() || sig.qty <= 0.0 || sig.qty > gates.max_qty_per_signal {
+        return Err(RiskRejection::InvalidQty);
+    }
+    let new_pos = position + delta;
+    if !new_pos.is_finite() || new_pos.abs() > gates.max_abs_position {
+        return Err(RiskRejection::PositionLimitExceeded);
+    }
+    if !rate.try_accept() {
+        return Err(RiskRejection::RateLimitExceeded);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn executor_thread(
     sig_rx:           SpscReader<Signal>,
     shutdown:         Arc<AtomicBool>,
     signals_consumed: Arc<AtomicU64>,
+    signals_rejected: Arc<AtomicU64>,
     position_atomic:  Arc<parking_lot::Mutex<f64>>,
+    gates:            RiskGates,
     core_id:          usize,
 ) {
     let cores = available_cores();
     let ok = pin_to_core(core_id % cores);
-    info!(core = core_id, affinity_set = ok, "executor thread started");
+    info!(core = core_id, affinity_set = ok, ?gates, "executor thread started");
 
     let mut position: f64 = 0.0;
     let mut total_signals: u64 = 0;
+    let mut rate = RateLimiter::new(gates.max_signals_per_sec);
 
-    // Drain remaining signals on shutdown so the last few are accounted for
-    // in metrics, then exit. The drain bound prevents an infinite loop if
-    // the producer is still pushing (it shouldn't be — strategy exits first).
     loop {
         match sig_rx.try_pop() {
             Some(sig) => {
-                total_signals += 1;
                 let delta = match sig.side() {
                     Side::Buy  =>  sig.qty,
                     Side::Sell => -sig.qty,
                 };
+
+                // ── risk gates ─────────────────────────────────────────────
+                if let Err(reason) = check_risk(&sig, position, delta, &gates, &mut rate) {
+                    signals_rejected.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        ?reason,
+                        symbol = sig.symbol_str(),
+                        side   = ?sig.side(),
+                        qty    = sig.qty,
+                        position,
+                        "signal REJECTED by risk gate"
+                    );
+                    continue;
+                }
+
+                total_signals += 1;
                 position += delta;
 
                 signals_consumed.store(total_signals, Ordering::Relaxed);
@@ -298,6 +392,7 @@ struct PollerHandles {
     ingester_stats:   Arc<dyn Fn() -> candlestore::IngesterStats + Send + Sync>,
     signals_produced: Arc<AtomicU64>,
     signals_consumed: Arc<AtomicU64>,
+    signals_rejected: Arc<AtomicU64>,
     position:         Arc<parking_lot::Mutex<f64>>,
     shutdown:         Arc<AtomicBool>,
 }
@@ -314,6 +409,7 @@ fn metrics_poller(h: PollerHandles) {
         let ig         = (h.ingester_stats)();
         let signals_p  = h.signals_produced.load(Ordering::Relaxed);
         let signals_c  = h.signals_consumed.load(Ordering::Relaxed);
+        let signals_r  = h.signals_rejected.load(Ordering::Relaxed);
         let pos        = *h.position.lock();
 
         metrics::counter!("candlestore_appends_total").absolute(store_snap.appends_total);
@@ -361,7 +457,16 @@ fn metrics_poller(h: PollerHandles) {
 
         metrics::counter!("candlestore_signals_total").absolute(signals_p);
         metrics::counter!("candlestore_executor_signals_total").absolute(signals_c);
+        metrics::counter!("candlestore_signals_rejected_total").absolute(signals_r);
         metrics::gauge!("candlestore_executor_position").set(pos);
+
+        // Risk-gate alert: signals being rejected means either a buggy
+        // strategy is over-producing OR position/qty limits are too tight
+        // for the current market regime. Either way ops needs to look.
+        if signals_r > 0 && signals_r.is_multiple_of(10) {
+            warn!(rejected = signals_r,
+                "executor risk gate is rejecting signals — strategy bug or limits too tight");
+        }
     }
     info!("metrics poller exiting on shutdown");
 }
@@ -434,6 +539,7 @@ fn main() {
     // ── counters shared between hot threads and the metrics poller ──────────
     let signals_produced = Arc::new(AtomicU64::new(0));
     let signals_consumed = Arc::new(AtomicU64::new(0));
+    let signals_rejected = Arc::new(AtomicU64::new(0));
     let position = Arc::new(parking_lot::Mutex::new(0.0f64));
 
     // ── spawn strategy thread ────────────────────────────────────────────────
@@ -454,15 +560,19 @@ fn main() {
 
     // ── spawn executor thread ────────────────────────────────────────────────
     let signals_consumed_for_exec = Arc::clone(&signals_consumed);
+    let signals_rejected_for_exec = Arc::clone(&signals_rejected);
     let position_for_exec = Arc::clone(&position);
     let shutdown_for_exec = Arc::clone(&shutdown);
+    let risk_gates = RiskGates::from_env();
     let executor_join = std::thread::Builder::new()
         .name("executor".into())
         .spawn(move || executor_thread(
             sig_rx,
             shutdown_for_exec,
             signals_consumed_for_exec,
+            signals_rejected_for_exec,
             position_for_exec,
+            risk_gates,
             (hub_core + 2) % cores,
         ))
         .expect("spawn executor thread");
@@ -473,6 +583,7 @@ fn main() {
         ingester_stats:   Arc::new(move || ingester_for_poller.stats()),
         signals_produced: Arc::clone(&signals_produced),
         signals_consumed: Arc::clone(&signals_consumed),
+        signals_rejected: Arc::clone(&signals_rejected),
         position:         Arc::clone(&position),
         shutdown:         Arc::clone(&shutdown),
     };
@@ -549,4 +660,92 @@ fn main() {
     drop(store);
 
     info!("graceful shutdown complete");
+}
+
+// ── tests ───────────────────────────────────────────────────────────────────
+//
+// Direct tests of the risk gate predicates. The threads themselves are
+// hard to test in isolation (they spin on SPSC rings and read env vars);
+// this exercises the pure logic.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candlestore::Side;
+
+    fn sig(qty: f64, side: Side) -> Signal {
+        Signal::try_new(0, "BTC", side, qty, 0.0, 0).unwrap()
+    }
+
+    fn default_gates() -> RiskGates {
+        RiskGates { max_abs_position: 10.0, max_qty_per_signal: 5.0, max_signals_per_sec: 100 }
+    }
+
+    #[test]
+    fn risk_accepts_within_limits() {
+        let g = default_gates();
+        let mut r = RateLimiter::new(g.max_signals_per_sec);
+        let s = sig(1.0, Side::Buy);
+        assert!(check_risk(&s, 0.0, 1.0, &g, &mut r).is_ok());
+    }
+
+    #[test]
+    fn risk_rejects_zero_qty() {
+        let g = default_gates();
+        let mut r = RateLimiter::new(g.max_signals_per_sec);
+        // Signal::try_new refuses 0.0 directly, so build the raw signal.
+        let mut s = sig(1.0, Side::Buy);
+        s.qty = 0.0;
+        assert_eq!(check_risk(&s, 0.0, 0.0, &g, &mut r), Err(RiskRejection::InvalidQty));
+    }
+
+    #[test]
+    fn risk_rejects_qty_above_max() {
+        let g = default_gates();
+        let mut r = RateLimiter::new(g.max_signals_per_sec);
+        // max_qty_per_signal = 5.0; ask for 10
+        let s = sig(10.0, Side::Buy);
+        assert_eq!(check_risk(&s, 0.0, 10.0, &g, &mut r), Err(RiskRejection::InvalidQty));
+    }
+
+    #[test]
+    fn risk_rejects_position_limit() {
+        let g = default_gates();
+        let mut r = RateLimiter::new(g.max_signals_per_sec);
+        let s = sig(5.0, Side::Buy);
+        // Already at +6, +5 more would be +11 > 10 limit
+        assert_eq!(
+            check_risk(&s, 6.0, 5.0, &g, &mut r),
+            Err(RiskRejection::PositionLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn risk_rate_limit_kicks_in_after_max_per_second() {
+        let g = RiskGates {
+            max_abs_position: 1000.0, max_qty_per_signal: 1000.0, max_signals_per_sec: 3
+        };
+        let mut r = RateLimiter::new(g.max_signals_per_sec);
+        let s = sig(1.0, Side::Buy);
+        // Bucket starts empty; allow 3 then reject.
+        assert!(check_risk(&s, 0.0, 1.0, &g, &mut r).is_ok());
+        assert!(check_risk(&s, 0.0, 1.0, &g, &mut r).is_ok());
+        assert!(check_risk(&s, 0.0, 1.0, &g, &mut r).is_ok());
+        assert_eq!(
+            check_risk(&s, 0.0, 1.0, &g, &mut r),
+            Err(RiskRejection::RateLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn risk_short_side_also_bounded() {
+        let g = default_gates();
+        let mut r = RateLimiter::new(g.max_signals_per_sec);
+        // Already at -8, sell 5 more would be -13 < -10 limit.
+        let s = sig(5.0, Side::Sell);
+        assert_eq!(
+            check_risk(&s, -8.0, -5.0, &g, &mut r),
+            Err(RiskRejection::PositionLimitExceeded)
+        );
+    }
 }
