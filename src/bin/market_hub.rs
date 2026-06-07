@@ -275,6 +275,46 @@ enum RiskRejection {
     RateLimitExceeded,
 }
 
+// ── position persistence ────────────────────────────────────────────────────
+//
+// O1 from the deep review. The executor's position lives in
+// Arc<Mutex<f64>>; without persistence, a SIGTERM-restart-during-market
+// cycle leaves the executor naked. We write the position to a single
+// line file atomically (temp file + rename) on every executed signal,
+// and read it back on startup. Crash window: at most one in-flight
+// signal between the position mutation and the file write.
+
+/// Load the persisted position from `path`, returning 0.0 if the file
+/// doesn't exist or is unparseable.
+fn load_position(path: &std::path::Path) -> f64 {
+    match std::fs::read_to_string(path) {
+        Ok(s) => s.trim().parse::<f64>().ok().filter(|p| p.is_finite()).unwrap_or_else(|| {
+            warn!(path = %path.display(), content = %s.trim(),
+                "position state file is unparseable — starting at 0.0");
+            0.0
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!(path = %path.display(),
+                "no position state file found — starting fresh at 0.0");
+            0.0
+        }
+        Err(e) => {
+            error!(path = %path.display(), error = %e,
+                "failed to read position state file — starting at 0.0");
+            0.0
+        }
+    }
+}
+
+/// Write position to `path` atomically via temp file + rename. Returns the
+/// IO error (without panicking) so the executor can count failures.
+fn persist_position(path: &std::path::Path, position: f64) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, format!("{position}\n"))?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Stateful rate-limit window — counts accepted signals in the current
 /// 1 s bucket and rolls over.
 struct RateLimiter {
@@ -324,15 +364,27 @@ fn executor_thread(
     signals_rejected: Arc<AtomicU64>,
     position_atomic:  Arc<parking_lot::Mutex<f64>>,
     gates:            RiskGates,
+    position_path:    Option<std::path::PathBuf>,
     core_id:          usize,
 ) {
     let cores = available_cores();
     let ok = pin_to_core(core_id % cores);
-    info!(core = core_id, affinity_set = ok, ?gates, "executor thread started");
+    info!(
+        core = core_id, affinity_set = ok, ?gates,
+        persistence = position_path.as_ref().map(|p| p.display().to_string()),
+        "executor thread started"
+    );
 
-    let mut position: f64 = 0.0;
+    // Load persisted position on startup. Default to 0 if no file or unparseable.
+    let mut position: f64 = position_path.as_deref().map(load_position).unwrap_or(0.0);
+    *position_atomic.lock() = position;
+    if position != 0.0 {
+        info!(loaded_position = position, "restored persisted position");
+    }
+
     let mut total_signals: u64 = 0;
     let mut rate = RateLimiter::new(gates.max_signals_per_sec);
+    let mut persist_errors: u64 = 0;
 
     loop {
         match sig_rx.try_pop() {
@@ -342,7 +394,6 @@ fn executor_thread(
                     Side::Sell => -sig.qty,
                 };
 
-                // ── risk gates ─────────────────────────────────────────────
                 if let Err(reason) = check_risk(&sig, position, delta, &gates, &mut rate) {
                     signals_rejected.fetch_add(1, Ordering::Relaxed);
                     warn!(
@@ -362,6 +413,18 @@ fn executor_thread(
                 signals_consumed.store(total_signals, Ordering::Relaxed);
                 *position_atomic.lock() = position;
 
+                // Persist after the in-memory update. If persistence fails,
+                // the in-memory position is still correct for the running
+                // process; restart will lose the recent execution(s).
+                if let Some(p) = position_path.as_deref()
+                    && let Err(e) = persist_position(p, position) {
+                    persist_errors += 1;
+                    if persist_errors == 1 || persist_errors.is_multiple_of(100) {
+                        error!(path = %p.display(), error = %e, total_errors = persist_errors,
+                            "position persistence failed — restart will lose recent state");
+                    }
+                }
+
                 info!(
                     n = total_signals,
                     side = ?sig.side(),
@@ -375,6 +438,7 @@ fn executor_thread(
                 if shutdown.load(Ordering::Relaxed) {
                     info!(
                         executed = total_signals, final_position = position,
+                        persist_errors,
                         "executor thread exiting on shutdown"
                     );
                     return;
@@ -564,6 +628,13 @@ fn main() {
     let position_for_exec = Arc::clone(&position);
     let shutdown_for_exec = Arc::clone(&shutdown);
     let risk_gates = RiskGates::from_env();
+    // POSITION_STATE_FILE=path/to/position.state enables persistence (O1).
+    // Leave unset for ephemeral in-memory only. The file format is a
+    // single floating-point literal (e.g. "1.5\n") written atomically
+    // via tmp+rename on every executed signal.
+    let position_path = std::env::var("POSITION_STATE_FILE")
+        .ok()
+        .map(std::path::PathBuf::from);
     let executor_join = std::thread::Builder::new()
         .name("executor".into())
         .spawn(move || executor_thread(
@@ -573,6 +644,7 @@ fn main() {
             signals_rejected_for_exec,
             position_for_exec,
             risk_gates,
+            position_path,
             (hub_core + 2) % cores,
         ))
         .expect("spawn executor thread");
@@ -747,5 +819,55 @@ mod tests {
             check_risk(&s, -8.0, -5.0, &g, &mut r),
             Err(RiskRejection::PositionLimitExceeded)
         );
+    }
+
+    // ── position persistence (O1) ──────────────────────────────────────────
+
+    #[test]
+    fn load_position_returns_zero_for_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does_not_exist.state");
+        assert_eq!(load_position(&path), 0.0);
+    }
+
+    #[test]
+    fn load_position_returns_zero_for_unparseable_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.state");
+        std::fs::write(&path, "not a number").unwrap();
+        assert_eq!(load_position(&path), 0.0);
+    }
+
+    #[test]
+    fn load_position_rejects_nan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nan.state");
+        std::fs::write(&path, "NaN").unwrap();
+        assert_eq!(load_position(&path), 0.0,
+            "NaN must not be loaded — would propagate into risk checks");
+    }
+
+    #[test]
+    fn persist_and_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.state");
+        persist_position(&path, 1.25).unwrap();
+        assert_eq!(load_position(&path), 1.25);
+
+        // Overwrite with a different value — atomicity smoke test.
+        persist_position(&path, -3.5).unwrap();
+        assert_eq!(load_position(&path), -3.5);
+    }
+
+    #[test]
+    fn persist_uses_atomic_rename_pattern() {
+        // After persist completes, the tmp file should not be lingering
+        // (rename absorbs it).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.state");
+        persist_position(&path, 7.0).unwrap();
+        assert!(path.exists());
+        assert!(!path.with_extension("tmp").exists(),
+            "tmp file must have been atomically renamed away");
     }
 }

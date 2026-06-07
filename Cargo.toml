@@ -9,6 +9,22 @@ path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]   # cdylib for C/Go FFI, rlib for Rust tests
 
 [features]
+# Default features include the observability-server stack so the binaries
+# (feed_handler, market_hub) get tracing-subscriber + the Prometheus HTTP
+# exporter out of the box. cdylib consumers (Go cgo, Python ctypes) who
+# only want CandleStore should build with --no-default-features to avoid
+# dragging tokio + hyper into their .so/.dylib.
+default = ["observability-server"]
+
+# Pulls in tracing-subscriber (log formatting) and metrics-exporter-prometheus
+# (HTTP /metrics endpoint). The latter brings hyper + tokio. Lib code uses
+# the `tracing` / `metrics` macro facades unconditionally — they no-op when
+# no subscriber/recorder is installed, so the FFI surface is unaffected.
+observability-server = [
+    "dep:tracing-subscriber",
+    "dep:metrics-exporter-prometheus",
+]
+
 feed = [
     "dep:tokio",
     "dep:tokio-tungstenite",
@@ -25,12 +41,18 @@ parquet     = "53"
 thiserror   = "1"
 num_cpus    = "1"
 
-# observability — lib emits via tracing facade and exposes atomic counters.
-# Subscribers/exporters are installed by binaries (see src/bin/*).
-tracing                     = "0.1"
-tracing-subscriber          = { version = "0.3", features = ["env-filter", "fmt"] }
-metrics                     = "0.23"
-metrics-exporter-prometheus = { version = "0.15", default-features = false, features = ["http-listener"] }
+# Always-on observability facades. These are tiny (~50 KB compiled, no
+# transitive heavies) and the lib emits via them. They no-op cleanly when
+# no subscriber/recorder is installed, so cdylib consumers can leave them
+# uninstalled.
+tracing = "0.1"
+metrics = "0.23"
+
+# Observability *server* (HTTP /metrics + log formatting). Optional so a
+# cdylib consumer that only wants the candle store can skip the tokio/hyper
+# dependency tree. Binaries enable this via the `observability-server` feature.
+tracing-subscriber          = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
+metrics-exporter-prometheus = { version = "0.15", default-features = false, features = ["http-listener"], optional = true }
 
 # Graceful shutdown — POSIX signal handling for SIGINT/SIGTERM. Unix only;
 # Windows would need ctrlc or similar, but the lib is already Unix-only (shm).
@@ -55,6 +77,14 @@ tempfile     = "3"
 tokio        = { version = "1", features = ["full"] }
 hashbrown    = "0.14"
 parking_lot  = "0.12"
+
+[[bin]]
+name              = "feed_handler"
+required-features = ["observability-server"]
+
+[[bin]]
+name              = "market_hub"
+required-features = ["observability-server"]
 
 [[bench]]
 name    = "bench"
