@@ -239,7 +239,7 @@ mod shm_impl {
 
     use libc::{
         MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE, c_char, ftruncate, mmap, munmap,
-        shm_open, shm_unlink, O_CREAT, O_RDWR, O_TRUNC,
+        shm_open, shm_unlink, O_CREAT, O_EXCL, O_RDWR,
     };
 
     /// Byte offset from the start of the mapping where candle slots begin.
@@ -256,50 +256,106 @@ mod shm_impl {
     ///
     /// Dropping this type calls `munmap` + `shm_unlink`, removing the segment.
     pub struct ShmRingWriter {
-        ptr:      *mut u8,
-        map_size: usize,
-        name:     String,
-        capacity: usize,
+        ptr:       *mut u8,
+        map_size:  usize,
+        name:      String,
+        capacity:  usize,
+        /// Lifetime counter — incremented once per `try_push` that returns
+        /// `false` and forced the caller to wait or back off. Read out via
+        /// [`stats`](Self::stats); useful for spotting "consumer is behind"
+        /// scenarios in production metrics.
+        push_full: AtomicU64,
+    }
+
+    /// Lifetime stats for an `ShmRingWriter`, exposed for metrics export.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct WriterStats {
+        /// Number of times the ring was full when the writer tried to push.
+        /// Sustained nonzero growth means the consumer cannot keep up.
+        pub push_full_events: u64,
+        /// Configured ring capacity (in slots).
+        pub ring_capacity:    u64,
     }
 
     /// SAFETY: The pointer `ptr` owns the mapped region exclusively until drop.
-    /// No other `ShmRingWriter` for the same name can exist simultaneously because
-    /// `shm_open(O_CREAT|O_TRUNC)` truncates the segment, making any previous
-    /// reader mapping stale.
+    /// With `O_CREAT|O_EXCL` (the default in [`ShmRingWriter::create`]) no
+    /// second producer can create a segment with the same name while ours is
+    /// alive, so the mapping is uniquely ours for its lifetime.
     unsafe impl Send for ShmRingWriter {}
+
+    /// SAFETY: `Sync` is sound for `ShmRingWriter` because all *mutating*
+    /// methods (`push`, `try_push`, `push_until`) maintain the SPSC
+    /// invariant: exactly one producer thread advances `head`. All other
+    /// methods (`stats`) only do atomic loads on counters owned by this
+    /// struct — safe from any number of concurrent observer threads (e.g.
+    /// the metrics poller). The SPSC contract is a documented user
+    /// obligation; the type does not enforce it.
+    unsafe impl Sync for ShmRingWriter {}
 
     impl ShmRingWriter {
         /// Create a new shared-memory ring with the given POSIX name and capacity.
+        ///
+        /// Opens with `O_CREAT | O_EXCL` — fails with [`io::ErrorKind::AlreadyExists`]
+        /// if a segment with that name already exists. This protects against two
+        /// racing producers each calling `create` with the same name (which would
+        /// silently corrupt each other under the old "unlink then create" pattern).
+        ///
+        /// For crash recovery (where the previous producer didn't run its Drop
+        /// and the segment was left behind), use [`create_force`](Self::create_force).
         ///
         /// `name` must start with `/` per POSIX convention.
         /// `capacity` must be a power of two.
         ///
         /// # Errors
         ///
-        /// Returns `io::Error` on `shm_open`, `ftruncate`, or `mmap` failure.
+        /// - [`io::ErrorKind::AlreadyExists`] if the segment is in use.
+        /// - Other `io::Error` on `shm_open`, `ftruncate`, or `mmap` failure.
         pub fn create(name: &str, capacity: usize) -> io::Result<Self> {
+            Self::create_inner(name, capacity, /*force=*/ false)
+        }
+
+        /// Create a SHM ring, removing any stale segment with the same name first.
+        ///
+        /// Use only for crash recovery — the normal path is [`create`](Self::create)
+        /// which fails loudly if the name is in use. `create_force` will silently
+        /// stomp on a running producer's segment, which is exactly the bug
+        /// `create` exists to prevent.
+        ///
+        /// Emits `tracing::warn!` so the action is visible in logs.
+        pub fn create_force(name: &str, capacity: usize) -> io::Result<Self> {
+            tracing::warn!(name, "ShmRingWriter::create_force — bypassing exclusivity check; \
+                                   any concurrently-running producer with this name will be corrupted");
+            Self::create_inner(name, capacity, /*force=*/ true)
+        }
+
+        fn create_inner(name: &str, capacity: usize, force: bool) -> io::Result<Self> {
             assert!(capacity.is_power_of_two(), "ShmRingWriter capacity must be a power of two");
 
             let cname = std::ffi::CString::new(name)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-            // Unlink any stale segment from a previous crash before creating a
-            // fresh one. On macOS, `O_TRUNC` on an already-mapped segment returns
-            // EINVAL; unlinking first avoids that.
-            // SAFETY: `shm_unlink` is safe to call with a valid C string even if
-            // the segment doesn't exist (it will just return -1 which we ignore).
-            unsafe { shm_unlink(cname.as_ptr() as *const c_char) };
+            if force {
+                // SAFETY: `shm_unlink` is safe to call with a valid C string even if
+                // the segment doesn't exist (returns -1, ignored).
+                unsafe { shm_unlink(cname.as_ptr() as *const c_char) };
+            }
 
+            // O_EXCL + O_CREAT ⇒ atomic create-or-fail. The race window between
+            // shm_unlink and shm_open in the old implementation is gone.
+            let mut flags = O_CREAT | O_RDWR;
+            if !force { flags |= O_EXCL; }
             // SAFETY: `shm_open` is a standard POSIX syscall. `cname` is valid.
-            let fd = unsafe {
-                shm_open(
-                    cname.as_ptr() as *const c_char,
-                    O_CREAT | O_RDWR | O_TRUNC,
-                    0o600,
-                )
-            };
+            let fd = unsafe { shm_open(cname.as_ptr() as *const c_char, flags, 0o600) };
             if fd < 0 {
-                return Err(io::Error::last_os_error());
+                let err = io::Error::last_os_error();
+                if !force && err.kind() == io::ErrorKind::AlreadyExists {
+                    tracing::error!(
+                        name, error = %err,
+                        "SHM segment already exists — another producer running, or a \
+                         crashed producer left a stale segment. Use create_force for recovery."
+                    );
+                }
+                return Err(err);
             }
 
             let map_size = mapping_size(capacity);
@@ -345,17 +401,59 @@ mod shm_impl {
             // Release fence ensures all prior stores are visible before ready is set.
             header_mut.ready.store(READY_MAGIC, Ordering::Release);
 
-            Ok(Self { ptr, map_size, name: name.to_owned(), capacity })
+            Ok(Self {
+                ptr, map_size,
+                name: name.to_owned(),
+                capacity,
+                push_full: AtomicU64::new(0),
+            })
         }
 
         /// Push a candle, spinning until space is available.
+        ///
+        /// **Warning**: spins forever if the consumer disappears. Prefer
+        /// [`push_until`](Self::push_until) for any production code path —
+        /// without an external cancel signal, SIGTERM cannot interrupt this.
         #[inline]
         pub fn push(&self, candle: Candle) {
-            loop {
-                if self.try_push(candle) {
-                    return;
+            if !self.try_push(candle) {
+                self.push_full.fetch_add(1, Ordering::Relaxed);
+                while !self.try_push(candle) {
+                    std::hint::spin_loop();
                 }
+            }
+        }
+
+        /// Push a candle, spinning until space is available OR `cancel` flips
+        /// to `true`. Returns `true` if the candle was pushed, `false` if the
+        /// caller cancelled first.
+        ///
+        /// Use this in any loop that must honour graceful shutdown. Without
+        /// it, [`push`](Self::push) hangs the calling thread forever when
+        /// the consumer is gone — which is exactly the bug that hid in
+        /// `feed_handler` before this method existed.
+        ///
+        /// `cancel` is loaded with `Relaxed` ordering on every spin
+        /// iteration; the cost is negligible against the `try_push` itself.
+        #[inline]
+        pub fn push_until(&self, candle: Candle, cancel: &AtomicBool) -> bool {
+            if self.try_push(candle) { return true; }
+            // Ring was full when we entered — count it once per stall, not
+            // per spin iteration (which would explode the counter).
+            self.push_full.fetch_add(1, Ordering::Relaxed);
+            while !self.try_push(candle) {
+                if cancel.load(Ordering::Relaxed) { return false; }
                 std::hint::spin_loop();
+            }
+            true
+        }
+
+        /// Lifetime counter snapshot for metrics export.
+        #[inline]
+        pub fn stats(&self) -> WriterStats {
+            WriterStats {
+                push_full_events: self.push_full.load(Ordering::Relaxed),
+                ring_capacity:    self.capacity as u64,
             }
         }
 
@@ -488,6 +586,24 @@ mod shm_impl {
                     ));
                 }
                 std::hint::spin_loop();
+            }
+
+            // CRITICAL: verify the writer's capacity matches what the reader
+            // expects. If they disagree, the reader's modulo `tail & (cap-1)`
+            // indexes slots the writer never wrote, leading to silent UB
+            // (off-mapping reads, garbage data, segfault).
+            let writer_capacity = header.capacity as usize;
+            if writer_capacity != capacity {
+                // SAFETY: unmapping the region we just created.
+                unsafe { munmap(ptr as *mut libc::c_void, map_size) };
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "ShmRingReader capacity mismatch: reader requested {capacity}, \
+                         writer created segment with {writer_capacity}. \
+                         The producer and consumer must agree on the ring size."
+                    ),
+                ));
             }
 
             Ok(Self { ptr, map_size, capacity })
@@ -680,7 +796,7 @@ mod shm_impl {
 
 // Re-export platform types at module level.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub use shm_impl::{ShmRingReader, ShmRingWriter, ShmIngester, IngesterStats};
+pub use shm_impl::{ShmRingReader, ShmRingWriter, ShmIngester, IngesterStats, WriterStats};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
@@ -764,21 +880,31 @@ mod tests {
 
     // ── ShmRingWriter / ShmRingReader (macOS / Linux only) ──────────────────
 
+    /// Unique per-test SHM segment name so failed tests don't leak state
+    /// across runs. Uses a static counter + the test thread id.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn unique_shm_name(prefix: &str) -> String {
+        use std::sync::atomic::AtomicU64;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!(
+            "/cs_test_{prefix}_{id}_{:?}",
+            std::thread::current().id()
+        ).replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '/', "")
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn shm_writer_reader_roundtrip() {
-        // On macOS, O_TRUNC on an already-mapped segment returns EINVAL.
-        // ShmRingWriter::create calls shm_unlink first to clear any stale
-        // segment from a previous test run before opening fresh.
-        let name = "/spsc1";
+        let name = unique_shm_name("rt");
         let cap = 64usize;
         let n = 100usize;
 
-        let w = ShmRingWriter::create(name, cap).expect("create shm writer");
+        let w = ShmRingWriter::create(&name, cap).expect("create shm writer");
 
-        // Open reader in a separate thread — it will spin until ready.
+        let name2 = name.clone();
         let reader_thread = std::thread::spawn(move || {
-            let r = ShmRingReader::open(name, cap).expect("open shm reader");
+            let r = ShmRingReader::open(&name2, cap).expect("open shm reader");
             let mut received = Vec::with_capacity(n);
             for _ in 0..n {
                 received.push(r.pop());
@@ -795,5 +921,102 @@ mod tests {
         for (i, c) in received.iter().enumerate() {
             assert_eq!(c.ts, i as i64);
         }
+    }
+
+    // ── S1: O_EXCL race-prevention ─────────────────────────────────────────
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn shm_writer_create_rejects_duplicate_with_already_exists() {
+        let name = unique_shm_name("excl");
+        let _w1 = ShmRingWriter::create(&name, 64).expect("first create succeeds");
+
+        // Second create on the SAME name must fail with AlreadyExists.
+        // Without O_EXCL the old code would silently corrupt the first writer.
+        match ShmRingWriter::create(&name, 64) {
+            Ok(_) => panic!("second create must fail"),
+            Err(e) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::AlreadyExists,
+                "expected AlreadyExists, got {e:?}"
+            ),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn shm_writer_create_force_overrides_existing_segment() {
+        let name = unique_shm_name("force");
+        let _w1 = ShmRingWriter::create(&name, 64).expect("first create succeeds");
+
+        // create_force is the documented recovery path — it unlinks first.
+        // This is racy by design (a running producer would be stomped) but
+        // we want the operator-controlled escape hatch.
+        let _w2 = ShmRingWriter::create_force(&name, 64).expect("create_force succeeds");
+    }
+
+    // ── S2: capacity-mismatch detection ────────────────────────────────────
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn shm_reader_open_rejects_capacity_mismatch() {
+        let name = unique_shm_name("cap");
+        let _w = ShmRingWriter::create(&name, 64).expect("create with cap=64");
+
+        // Reader requests a different capacity → must fail rather than
+        // mapping a wrong-sized region and silently reading garbage.
+        match ShmRingReader::open(&name, 128) {
+            Ok(_) => panic!("mismatched capacity must fail"),
+            Err(e) => {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::InvalidData,
+                    "expected InvalidData, got {e:?}"
+                );
+                assert!(
+                    e.to_string().contains("capacity mismatch"),
+                    "error message must mention capacity mismatch: {e}"
+                );
+            }
+        }
+    }
+
+    // ── S3: push_until honours the cancel signal ───────────────────────────
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn shm_writer_push_until_returns_false_on_cancel() {
+        use std::time::Duration;
+        let name = unique_shm_name("cancel");
+        let cap = 4usize;
+        let writer = ShmRingWriter::create(&name, cap).expect("create");
+
+        // Fill the ring so try_push fails. No reader → writer would spin
+        // forever in `push`; `push_until` must bail on the cancel signal.
+        for i in 0..cap {
+            assert!(writer.try_push(candle(i as i64)));
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_signal = Arc::clone(&cancel);
+        let cancel_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            cancel_signal.store(true, Ordering::Release);
+        });
+
+        let start = std::time::Instant::now();
+        let pushed = writer.push_until(candle(99), &cancel);
+        let elapsed = start.elapsed();
+        cancel_thread.join().unwrap();
+
+        assert!(!pushed, "push_until must return false when cancel fires");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "push_until must exit promptly after cancel, took {elapsed:?}"
+        );
+
+        // Backpressure counter incremented (consumer was behind).
+        let stats = writer.stats();
+        assert_eq!(stats.push_full_events, 1, "exactly one stall expected");
     }
 }

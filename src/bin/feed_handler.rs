@@ -74,9 +74,14 @@ fn install_metrics_endpoint() {
     }
 }
 
-/// Spawn a 1-Hz metrics-publishing thread reading from `candles_pushed`.
-/// Exits cleanly when `shutdown` is set.
-fn spawn_metrics_poller(candles_pushed: Arc<AtomicU64>, shutdown: Arc<AtomicBool>) {
+/// Spawn a 1-Hz metrics-publishing thread reading from `candles_pushed` and
+/// the writer's lifetime stats. Exits cleanly when `shutdown` is set.
+/// Returns the JoinHandle so the caller can join before dropping the writer.
+fn spawn_metrics_poller(
+    candles_pushed: Arc<AtomicU64>,
+    writer:         Arc<ShmRingWriter>,
+    shutdown:       Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("metrics-poller".into())
         .spawn(move || {
@@ -84,15 +89,42 @@ fn spawn_metrics_poller(candles_pushed: Arc<AtomicU64>, shutdown: Arc<AtomicBool
                 "candlestore_feed_candles_pushed_total",
                 "Total candles pushed by feed_handler to the SHM ring."
             );
+            metrics::describe_counter!(
+                "candlestore_feed_push_full_total",
+                "Lifetime count of pushes that found the ring full and had to wait. \
+                 Sustained growth means the downstream consumer is behind."
+            );
+            metrics::describe_gauge!(
+                "candlestore_feed_ring_capacity",
+                "Configured SHM ring capacity (slots)."
+            );
+
             while !shutdown.load(Ordering::Relaxed) {
-                // Park for up to 1 s so shutdown is observed within that window.
                 std::thread::park_timeout(Duration::from_secs(1));
                 let n = candles_pushed.load(Ordering::Relaxed);
                 metrics::counter!("candlestore_feed_candles_pushed_total").absolute(n);
+
+                let stats = writer.stats();
+                metrics::counter!("candlestore_feed_push_full_total")
+                    .absolute(stats.push_full_events);
+                metrics::gauge!("candlestore_feed_ring_capacity")
+                    .set(stats.ring_capacity as f64);
+
+                // Operator alert: sustained backpressure means consumer death
+                // or persistent under-provisioning. We can't fix it here, but
+                // we surface it loudly so it's not silently ignored.
+                if stats.push_full_events > 0
+                    && stats.push_full_events.is_multiple_of(10_000)
+                {
+                    warn!(
+                        push_full_events = stats.push_full_events,
+                        "SHM consumer is behind — push has stalled this many times"
+                    );
+                }
             }
             info!("metrics poller exiting");
         })
-        .expect("spawn metrics-poller");
+        .expect("spawn metrics-poller")
 }
 
 /// Register SIGINT + SIGTERM handlers that flip `shutdown` to `true`.
@@ -104,26 +136,10 @@ fn install_signal_handlers(shutdown: &Arc<AtomicBool>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Spin-push that periodically checks the shutdown flag. Without this, a
-/// downstream consumer (market_hub) that exits leaves the SHM ring full;
-/// `ShmRingWriter::push` would spin forever and the feed_handler would
-/// ignore SIGTERM until the ring drained (i.e. never).
-///
-/// Returns `true` if pushed, `false` if shutdown signal observed.
-#[inline]
-fn push_or_shutdown(
-    writer:   &ShmRingWriter,
-    candle:   Candle,
-    shutdown: &AtomicBool,
-) -> bool {
-    while !writer.try_push(candle) {
-        if shutdown.load(Ordering::Relaxed) {
-            return false;
-        }
-        std::hint::spin_loop();
-    }
-    true
-}
+// The shutdown-aware push pattern moved into the library as
+// `ShmRingWriter::push_until(candle, &cancel)`. The local helper that used
+// to live here has been removed; the hot loop below calls the lib method
+// directly so library consumers get the same shutdown safety for free.
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
@@ -154,10 +170,20 @@ fn main() {
     );
 
     // ── create SHM ring ──────────────────────────────────────────────────────
+    // `ShmRingWriter::create` uses O_EXCL — fails loudly if another producer
+    // is already using this name rather than silently corrupting it. Use
+    // create_force only for crash recovery (operator decision, not automatic).
     let writer = match ShmRingWriter::create(&shm_name, shm_cap) {
-        Ok(w) => w,
+        Ok(w) => Arc::new(w),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            error!(%shm_name, error = %e,
+                "SHM segment already in use. If you are CERTAIN no other producer is \
+                 running (e.g. recovering from a crashed previous run), restart with \
+                 a different FEED_SHM_NAME or manually `rm /tmp/{}`.", shm_name.trim_start_matches('/'));
+            std::process::exit(1);
+        }
         Err(e) => {
-            error!(%shm_name, error = %e, "failed to create SHM ring (is another feed running?)");
+            error!(%shm_name, error = %e, "failed to create SHM ring");
             std::process::exit(1);
         }
     };
@@ -165,7 +191,11 @@ fn main() {
 
     // ── metrics: 1-Hz poller fed by the hot-loop counter ─────────────────────
     let candles_pushed = Arc::new(AtomicU64::new(0));
-    spawn_metrics_poller(Arc::clone(&candles_pushed), Arc::clone(&shutdown));
+    let poller_join = spawn_metrics_poller(
+        Arc::clone(&candles_pushed),
+        Arc::clone(&writer),
+        Arc::clone(&shutdown),
+    );
 
     // ── generate candles ─────────────────────────────────────────────────────
     let interval  = Duration::from_nanos(1_000_000_000 / rate as u64);
@@ -201,7 +231,7 @@ fn main() {
         price = close;
 
         let candle = Candle { ts: now_nanos(), open, high, low, close, volume };
-        if !push_or_shutdown(&writer, candle, &shutdown) {
+        if !writer.push_until(candle, &shutdown) {
             // Shutdown signal observed while waiting for ring space — exit
             // the hot loop and let the graceful-shutdown block below run.
             break;
@@ -225,8 +255,16 @@ fn main() {
     // Final metric flush so a Prometheus scrape post-shutdown gets the
     // up-to-date count.
     candles_pushed.store(count, Ordering::Relaxed);
-    // `writer` drops here → munmap + shm_unlink cleans up the segment so the
-    // next feed_handler start doesn't see a stale segment.
+
+    // Join the metrics poller FIRST. While its Arc<ShmRingWriter> is alive,
+    // dropping our local `writer` Arc here would NOT trigger ShmRingWriter::
+    // Drop (refcount > 0) and shm_unlink would be deferred until after the
+    // process started exiting. Joining the poller first guarantees we drop
+    // the last reference cleanly.
+    poller_join.thread().unpark();
+    let _ = poller_join.join();
+
+    // Now writer is the sole Arc → Drop fires → munmap + shm_unlink.
     drop(writer);
     info!("SHM segment unlinked, feed_handler stopped");
 }
