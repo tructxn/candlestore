@@ -71,6 +71,10 @@ pub struct CandleStore {
     /// Lifetime appends rejected because an eviction spill failed and the
     /// store would have lost existing data to admit the new candle.
     appends_rejected: AtomicU64,
+    /// Lifetime candles rejected at the boundary for NaN/Inf/negative-ts.
+    invalid_candles: AtomicU64,
+    /// Lifetime appends accepted but whose ts went backwards. See snapshot doc.
+    out_of_order: AtomicU64,
 }
 
 /// Error returned from [`CandleStore::try_append`] when the store cannot
@@ -100,6 +104,20 @@ pub enum AppendError {
         #[source]
         source: parquet::SpillError,
     },
+    /// The candle failed [`Candle::is_valid`] — at least one f64 field is
+    /// NaN/Infinity or `ts` is negative. Rejected at the boundary so the
+    /// poison value doesn't propagate into SMAs, executor positions, or
+    /// metrics.
+    ///
+    /// Operator action: fix the producer. If a real feed is sending
+    /// occasional NaN/Inf (some venues do under maintenance), filter
+    /// upstream rather than relaxing this check — once it's in the store,
+    /// every downstream computation goes NaN forever.
+    #[error("candle rejected: invalid field (NaN/Inf/negative-ts)")]
+    InvalidCandle {
+        /// The symbol the rejected candle was destined for.
+        symbol: String,
+    },
 }
 
 /// Lifetime counter snapshot for metrics export.
@@ -127,6 +145,15 @@ pub struct StoreSnapshot {
     /// Lifetime appends rejected to preserve existing data when a Parquet
     /// spill failed. See [`AppendError::EvictionSpillFailed`].
     pub appends_rejected_total:     u64,
+    /// Lifetime candles rejected for NaN/Infinity/negative-ts.
+    /// See [`AppendError::InvalidCandle`].
+    pub invalid_candles_total:      u64,
+    /// Lifetime appends accepted but whose ts went BACKWARDS vs the previous
+    /// candle on the same symbol. The candle is still stored, but binary-
+    /// search range queries may miss it. Sustained growth means the producer
+    /// is sending late updates and the system should be rebuilt with a
+    /// re-sort strategy or accept the discrepancy.
+    pub out_of_order_total:         u64,
 }
 
 impl CandleStore {
@@ -151,6 +178,8 @@ impl CandleStore {
             parquet_spill_bytes:  AtomicU64::new(0),
             parquet_spill_errors: AtomicU64::new(0),
             appends_rejected:     AtomicU64::new(0),
+            invalid_candles:      AtomicU64::new(0),
+            out_of_order:         AtomicU64::new(0),
         }
     }
 
@@ -162,26 +191,48 @@ impl CandleStore {
 
     // ── write ─────────────────────────────────────────────────────────────────
 
-    /// Fire-and-forget append. On a Parquet spill failure during LRU eviction,
-    /// this logs an error and increments `appends_rejected_total` rather than
-    /// silently dropping the existing data. The **new** candle is dropped to
-    /// preserve the existing data already in RAM.
+    /// Fire-and-forget append. On a Parquet spill failure during LRU eviction
+    /// OR an invalid (NaN/Inf/negative-ts) candle, this logs an error and
+    /// increments the appropriate counter. The candle is dropped; existing
+    /// data is preserved.
     ///
     /// Use [`try_append`](Self::try_append) when you need a `Result` to
-    /// branch on, e.g. to halt ingestion when disk health degrades.
+    /// branch on, e.g. to halt ingestion when disk health degrades or to
+    /// surface invalid input to upstream.
     pub fn append(&self, symbol: &str, candle: Candle) {
         if let Err(e) = self.try_append(symbol, candle) {
-            self.appends_rejected.fetch_add(1, Ordering::Relaxed);
+            // Note: try_append already increments the specific counter for
+            // InvalidCandle. appends_rejected_total is for spill failures
+            // specifically. Branch on the variant.
+            match &e {
+                AppendError::InvalidCandle { .. }     => {} // counter already bumped
+                AppendError::EvictionSpillFailed { .. } => {
+                    self.appends_rejected.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             tracing::error!(symbol = %symbol, error = %e,
                 "append rejected — existing data preserved");
         }
     }
 
-    /// Strict append. Returns `Err(AppendError::EvictionSpillFailed)` when
-    /// the store is full and the LRU eviction's Parquet spill failed.
-    /// On error the store state is unchanged — both the new candle and the
-    /// LRU candidate's data remain (the LRU stays in RAM).
+    /// Strict append. Returns:
+    /// - `Err(AppendError::InvalidCandle)` if the candle has NaN/Inf/negative-ts.
+    ///   Validated at the boundary so poison values never enter the ring.
+    /// - `Err(AppendError::EvictionSpillFailed)` when the store is full and
+    ///   the LRU eviction's Parquet spill failed.
+    ///
+    /// On error the store state is unchanged. Out-of-order candles are
+    /// accepted but counted in `out_of_order_total`.
     pub fn try_append(&self, symbol: &str, candle: Candle) -> Result<(), AppendError> {
+        // ── boundary validation ───────────────────────────────────────────────
+        // Hot-path cost: 5 is_finite() calls + 1 i64 compare ≈ 1-2 ns. Worth it
+        // to keep NaN out of the system; once it's in, every SMA, every
+        // executor delta, every gauge propagates NaN forever.
+        if !candle.is_valid() {
+            self.invalid_candles.fetch_add(1, Ordering::Relaxed);
+            return Err(AppendError::InvalidCandle { symbol: symbol.to_owned() });
+        }
+
         let tick = self.tick.fetch_add(1, Ordering::Relaxed);
 
         // ── fast path: symbol already exists ──────────────────────────────────
@@ -195,7 +246,14 @@ impl CandleStore {
 
         if let Some(entry) = entry {
             entry.last_access.store(tick, Ordering::Relaxed);
-            entry.buf.write().push(candle);
+            let outcome = entry.buf.write().push(candle);
+            if let crate::ring_buffer::PushOutcome::OutOfOrder { prev_ts, this_ts } = outcome {
+                self.out_of_order.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    symbol, prev_ts, this_ts,
+                    "out-of-order candle — binary-search range queries may miss it"
+                );
+            }
             self.version.fetch_add(1, Ordering::Release);
             return Ok(());
         }
@@ -226,7 +284,14 @@ impl CandleStore {
         if let Some(entry) = g.get(symbol).cloned() {
             drop(g);
             entry.last_access.store(tick, Ordering::Relaxed);
-            entry.buf.write().push(candle);
+            let outcome = entry.buf.write().push(candle);
+            if let crate::ring_buffer::PushOutcome::OutOfOrder { prev_ts, this_ts } = outcome {
+                self.out_of_order.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    symbol, prev_ts, this_ts,
+                    "out-of-order candle — binary-search range queries may miss it"
+                );
+            }
             self.version.fetch_add(1, Ordering::Release);
             return Ok(());
         }
@@ -285,9 +350,10 @@ impl CandleStore {
             }
         }
 
-        // Now safe to insert the new symbol.
+        // Now safe to insert the new symbol. First push of a new RingBuffer
+        // is always Ok (no prior ts to compare against) — discard outcome.
         let mut buf = RingBuffer::new(self.ring_capacity);
-        buf.push(candle);
+        let _ = buf.push(candle);
         g.insert(symbol.to_string(), Arc::new(Entry {
             buf:         RwLock::new(buf),
             last_access: AtomicU64::new(tick),
@@ -376,6 +442,8 @@ impl CandleStore {
             parquet_spill_bytes_total:  self.parquet_spill_bytes.load(Ordering::Relaxed),
             parquet_spill_errors_total: self.parquet_spill_errors.load(Ordering::Relaxed),
             appends_rejected_total:     self.appends_rejected.load(Ordering::Relaxed),
+            invalid_candles_total:      self.invalid_candles.load(Ordering::Relaxed),
+            out_of_order_total:         self.out_of_order.load(Ordering::Relaxed),
         }
     }
 
@@ -681,6 +749,7 @@ mod tests {
                 assert_eq!(evicted_symbol, "BTC");
                 assert_eq!(candles_lost, 3);
             }
+            AppendError::InvalidCandle { .. } => panic!("candle was valid; expected spill failure"),
         }
 
         // Critically: BTC's data must still be in RAM. ETH must NOT be in the map.
@@ -764,5 +833,64 @@ mod tests {
 
         assert_eq!(store.symbol_count(), 1);
         assert_eq!(store.candle_count("RACE"), (2 * n) as usize);
+    }
+
+    // ── Phase 11: boundary validation ───────────────────────────────────────
+
+    fn bad_candle(field: u8) -> Candle {
+        let mut c = candle(1);
+        match field {
+            0 => c.ts     = -1,
+            1 => c.open   = f64::NAN,
+            2 => c.high   = f64::INFINITY,
+            3 => c.low    = f64::NEG_INFINITY,
+            4 => c.close  = f64::NAN,
+            5 => c.volume = f64::NAN,
+            _ => unreachable!(),
+        }
+        c
+    }
+
+    #[test]
+    fn try_append_rejects_nan_field() {
+        let store = CandleStore::new(4);
+        for f in 0..=5u8 {
+            let bad = bad_candle(f);
+            match store.try_append("BTC", bad) {
+                Err(AppendError::InvalidCandle { symbol }) => assert_eq!(symbol, "BTC"),
+                other => panic!("expected InvalidCandle for field {f}, got {other:?}"),
+            }
+        }
+        // No symbol entered the store.
+        assert_eq!(store.symbol_count(), 0);
+        let snap = store.snapshot();
+        assert_eq!(snap.invalid_candles_total, 6);
+        assert_eq!(snap.appends_total, 0);
+    }
+
+    #[test]
+    fn append_rejects_invalid_candle_without_polluting_existing_data() {
+        let store = CandleStore::new(4);
+        store.append("BTC", candle(1));
+        store.append("BTC", candle(2));
+        // Now feed garbage — must not affect what's stored.
+        store.append("BTC", bad_candle(4)); // close = NaN
+        store.append("BTC", bad_candle(5)); // volume = NaN
+        assert_eq!(store.candle_count("BTC"), 2);
+        let snap = store.snapshot();
+        assert_eq!(snap.invalid_candles_total, 2);
+        assert_eq!(snap.appends_total, 2, "version only bumps on accepted appends");
+    }
+
+    #[test]
+    fn out_of_order_candle_counted_but_accepted() {
+        let store = CandleStore::new(4);
+        store.append("BTC", candle(10));
+        store.append("BTC", candle(20));
+        store.append("BTC", candle(15)); // out-of-order
+        assert_eq!(store.candle_count("BTC"), 3, "OOO candle stored");
+        let snap = store.snapshot();
+        assert_eq!(snap.out_of_order_total, 1);
+        assert_eq!(snap.appends_total, 3);
     }
 }

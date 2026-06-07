@@ -136,6 +136,16 @@ fn describe_all_metrics() {
         "candlestore_executor_position",
         "Current paper position (positive = long, negative = short)."
     );
+    metrics::describe_counter!(
+        "candlestore_invalid_candles_total",
+        "Lifetime candles rejected at the boundary for NaN/Inf/negative-ts. \
+         Sustained growth means the producer is sending garbage."
+    );
+    metrics::describe_counter!(
+        "candlestore_out_of_order_total",
+        "Lifetime candles accepted but whose ts went backwards. May be \
+         invisible to binary-search range queries until a re-sort runs."
+    );
 }
 
 // ── SMA crossover strategy ──────────────────────────────────────────────────
@@ -315,14 +325,26 @@ fn metrics_poller(h: PollerHandles) {
             .absolute(store_snap.parquet_spill_errors_total);
         metrics::counter!("candlestore_appends_rejected_total")
             .absolute(store_snap.appends_rejected_total);
-        // Operator alert: a sustained drift in this rate means disk health
-        // is degrading — appends are being dropped, not just delayed.
+        metrics::counter!("candlestore_invalid_candles_total")
+            .absolute(store_snap.invalid_candles_total);
+        metrics::counter!("candlestore_out_of_order_total")
+            .absolute(store_snap.out_of_order_total);
+
+        // Operator alerts.
         if store_snap.appends_rejected_total > 0
             && store_snap.appends_rejected_total.is_multiple_of(1000)
         {
             warn!(
                 total = store_snap.appends_rejected_total,
                 "appends being rejected — Parquet spill is failing, investigate disk"
+            );
+        }
+        if store_snap.invalid_candles_total > 0
+            && store_snap.invalid_candles_total.is_multiple_of(100)
+        {
+            warn!(
+                total = store_snap.invalid_candles_total,
+                "invalid candles rejected — producer is sending NaN/Inf/negative-ts"
             );
         }
 

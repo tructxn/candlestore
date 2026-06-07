@@ -37,7 +37,7 @@ fn bench_ring_vs_vec_append(c: &mut Criterion) {
             b.iter(|| {
                 let mut ring = RingBuffer::new(10_240);
                 for i in 0..n {
-                    ring.push(make_candle(i as i64));
+                    let _ = ring.push(make_candle(i as i64));
                 }
                 black_box(ring.len())
             });
@@ -124,13 +124,13 @@ fn bench_l3_fit_vs_overflow(c: &mut Criterion) {
     for window in [100i64, 1_000] {
         group.bench_with_input(BenchmarkId::new("l3_fit", window), &window, |b, &w| {
             let mut ring = RingBuffer::new(fit_cap);
-            for i in 0..fit_cap as i64 { ring.push(make_candle(i)); }
+            for i in 0..fit_cap as i64 { let _ = ring.push(make_candle(i)); }
             b.iter(|| black_box(ring.range(0, w)));
         });
 
         group.bench_with_input(BenchmarkId::new("l3_overflow", window), &window, |b, &w| {
             let mut ring = RingBuffer::new(overflow_cap);
-            for i in 0..overflow_cap as i64 { ring.push(make_candle(i)); }
+            for i in 0..overflow_cap as i64 { let _ = ring.push(make_candle(i)); }
             b.iter(|| black_box(ring.range(0, w)));
         });
     }
