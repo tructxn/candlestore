@@ -493,16 +493,21 @@ fn main() {
 
     // ── shutdown sequence ────────────────────────────────────────────────────
     //
-    // Ordering matters:
-    // 1. signal_waiters() — wakes the strategy thread out of wait_for_change.
-    // 2. Join strategy   — it exits cleanly, dropping sig_tx (the SpscWriter).
-    // 3. Join executor   — it sees the shutdown flag on the next empty pop.
-    // 4. Join poller     — it observes shutdown within ≤1s of being unparked.
-    // 5. Drop the last `ingester` Arc — triggers ShmIngester::Drop → stop()
-    //    → the ingester thread joins, and the inner ShmRingReader's Drop
-    //    calls munmap on the shared segment (writer-side does shm_unlink).
-    // 6. Drop the last `store` Arc.
+    // Ordering matters (O5 from the deep review):
+    // 1. ingester.stop_signal() — halts the SHM pop loop FIRST. Otherwise
+    //    the ingester keeps pumping candles into a store no one is reading
+    //    while we wait for strategy/executor/poller to join. Visible as
+    //    wasted CPU on hub_core during the join window.
+    // 2. signal_waiters() — wakes the strategy thread out of wait_for_change.
+    // 3. Join strategy   — it exits cleanly, dropping sig_tx (the SpscWriter).
+    // 4. Join executor   — it sees the shutdown flag on the next empty pop.
+    // 5. Join poller     — it observes shutdown within ≤1s of being unparked.
+    // 6. Drop the last `ingester` Arc — Drop → stop() (now a no-op since
+    //    we already signalled in step 1) → join thread. ShmRingReader's
+    //    Drop calls munmap on the shared segment (writer-side does shm_unlink).
+    // 7. Drop the last `store` Arc.
 
+    ingester.stop_signal();
     store.signal_waiters();
     // Also unpark each thread explicitly in case they're between iterations.
     strategy_join.thread().unpark();

@@ -2,6 +2,28 @@
 
 All numbers measured on Apple M-series (10 physical cores, 4 MB L3 cache), release build.
 
+## At a glance
+
+The headline figures, kept up to date as the codebase evolves. Detailed methodology
+follows in the per-suite sections below.
+
+| Operation                                | Latency / Throughput   |
+|------------------------------------------|------------------------|
+| `CandleStore::append` (1 thread, hot)    | 19 ns · 53M ops/sec    |
+| `CandleStore::append` (4 sym × 4 t)      | 6.2M ops/sec/thread (1.59× parallelism) |
+| `CandleStore::range` (W=100)             | 210 ns                 |
+| `CandleStore::range` (W=1,000)           | 1.0 µs                 |
+| `CandleStore::range` (W=5,000)           | 4.32 µs                |
+| `CandleStore::last_n` (N=10)             | 65 ns                  |
+| `CandleStore::last_n` (N=100)            | 108 ns                 |
+| `CandleStore::wait_for_change` wake-up   | 14 µs p50              |
+| `ShmRingWriter::push` (in-process)       | 31 ns                  |
+| SHM ring transit (cross-process)         | 77 ns / 19M msg/sec    |
+| SHM pipeline end-to-end (ring + store)   | 52 ns/msg / 19M cnd/sec|
+| `SpscRing<T>` push (in-process)          | 28M msg/sec            |
+| `parquet::spill` write 10k candles       | ~100 µs (disk bound)   |
+| Parquet cold read 1k candles             | 409 µs (23× hot)       |
+
 ```
 cargo bench                            # run all benchmarks
 cargo bench --bench design_decisions   # architectural decisions only

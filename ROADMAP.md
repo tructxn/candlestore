@@ -89,6 +89,23 @@ Hot data in RAM, cold data spilled to Parquet. No server, no GC, no SQL overhead
 
 ---
 
+## Phase 8 — SHM Ingestion Pipeline ✅
+> Connect the SPSC shared-memory ring to the CandleStore, completing the
+> feed handler → store → strategy data path.
+
+- [x] `ShmIngester` — background thread that spins on `ShmRingReader::try_pop()`,
+      calling `store.append(symbol, candle)` on every message
+- [x] `ShmIngester::start(reader, Arc<CandleStore>, symbol)` — non-blocking factory;
+      thread runs until `stop()` or `Drop`
+- [x] `ShmIngester::stop()` — signals thread via `AtomicBool`, joins before returning
+- [x] `examples/shm_pipeline.rs` — end-to-end demo: feed thread → SHM ring →
+      ShmIngester → CandleStore → `range()` query; asserts all 50k candles land
+- [x] Architecture diagram in README updated to show the full IPC path
+- [x] Per-message IPC latency: **77 ns** (SPSC atomic CAS, no kernel, no copy)
+- [x] 44 tests passing
+
+---
+
 ## Phase 9 — Trading System Kernel ✅
 > Full multi-process, multi-core trading pipeline with dedicated threads per
 > component and SPSC rings as the inter-component bus.
@@ -113,23 +130,6 @@ Run in two terminals:
   cargo run --release --bin feed_handler
   cargo run --release --bin market_hub
 ```
-
----
-
-## Phase 8 — SHM Ingestion Pipeline ✅
-> Connect the SPSC shared-memory ring to the CandleStore, completing the
-> feed handler → store → strategy data path.
-
-- [x] `ShmIngester` — background thread that spins on `ShmRingReader::try_pop()`,
-      calling `store.append(symbol, candle)` on every message
-- [x] `ShmIngester::start(reader, Arc<CandleStore>, symbol)` — non-blocking factory;
-      thread runs until `stop()` or `Drop`
-- [x] `ShmIngester::stop()` — signals thread via `AtomicBool`, joins before returning
-- [x] `examples/shm_pipeline.rs` — end-to-end demo: feed thread → SHM ring →
-      ShmIngester → CandleStore → `range()` query; asserts all 50k candles land
-- [x] Architecture diagram in README updated to show the full IPC path
-- [x] Per-message IPC latency: **77 ns** (SPSC atomic CAS, no kernel, no copy)
-- [x] 44 tests passing
 
 ---
 
@@ -247,6 +247,80 @@ Run in two terminals:
 - strategy wake-up: 14 µs p50
 - IPC SPSC ring: ~77 ns rendezvous, ~19 Melem/s sustained
 - SHM pipeline end-to-end: 19M candles/sec (1.7× IPC overhead vs direct)
+
+---
+
+## Phase 11 — Second-Pass Hardening ✅
+> Findings from a second honest review of the codebase against enterprise
+> production standards. The first review (Phase 10) closed the obvious gaps;
+> this phase closes the second-order ones — concurrency edge cases,
+> boundary validation, and real cross-process / FFI test coverage.
+
+### 11.1 SHM safety ✅ (commit 0189cdb)
+- [x] S1: `ShmRingWriter::create` now uses `O_CREAT | O_EXCL` — second
+      producer for the same name fails with `AlreadyExists` instead of
+      silently corrupting the first. `create_force()` provided for
+      operator-controlled crash recovery.
+- [x] S2: `ShmRingReader::open` verifies `header.capacity` matches the
+      caller's argument — mismatch returns `InvalidData` instead of UB.
+- [x] S3: `ShmRingWriter::push_until(candle, &AtomicBool)` — cancellable
+      variant of `push` for safe shutdown. Replaces the per-binary
+      `push_or_shutdown` workaround.
+- [x] O4: `ShmRingWriter::stats()` exposes lifetime `push_full_events` —
+      ops can see "consumer is behind" in Prometheus. Surfaced as
+      `candlestore_feed_push_full_total`.
+
+### 11.2 Boundary validation ✅ (commit 4a0f0cd)
+- [x] S5: `Candle::is_valid()` rejects NaN/Inf/negative-ts. `try_append`
+      returns `AppendError::InvalidCandle` at the boundary — no more
+      NaN propagating into SMAs and executor positions.
+- [x] S6: `RingBuffer::push` returns `PushOutcome { Ok | OutOfOrder }`.
+      Store counts OOO events in `out_of_order_total` and emits a
+      tracing::warn! per event. Operators learn before the binary-search
+      range query starts silently missing data.
+- [x] Q1: `Signal::try_new` returns Result, rejecting `SymbolTooLong`
+      and `NonFiniteField`. The old `Signal::new` kept for back-compat
+      but now logs warn! on truncation.
+
+### 11.3 Order book + clock skew ✅ (commit f2ea192)
+- [x] S4: `(p * 1e8).round() as u64` replaced with bounds-checked
+      `try_price_key`. Rejects NaN/Inf/negative/overflow with structured
+      `BookError`. `OrderBook::try_submit` for strict consumers; the
+      convenience `submit` now emits `CancelReason::InvalidOrder`
+      instead of panicking.
+- [x] R8: `feed_handler` stamps candles with monotonic ts via
+      `next_ts(last_ts)` — NTP clock-backwards corrections can no
+      longer break downstream binary-search range queries.
+
+### 11.4 Eviction race ✅
+- [x] R5: `Entry::removed: AtomicBool` set under the buf write lock
+      during eviction, checked by the fast-path appender after acquiring
+      buf.write(). Closes the "Arc holder pushes to a dead Entry"
+      data-loss window. Tested with a 3-thread stress test
+      (`appends_during_concurrent_eviction_are_never_lost`).
+
+### 11.5 Integration tests ✅
+- [x] R3: `tests/cross_process_shm.rs` uses `std::env::current_exe()`
+      self-spawn to test the SHM ring across two OS processes:
+      writer-in-parent + reader-in-child roundtrip; capacity-mismatch
+      detection; O_EXCL second-producer rejection.
+- [x] R4: `tests/ffi.rs` exercises every `candlestore_*` extern function
+      with valid input, null pointers, oversize buffer clamping, and
+      NaN-candle passthrough. 10 tests.
+
+### 11.6 Operability touch-ups (this commit)
+- [x] O5: `ShmIngester::stop_signal(&self)` — market_hub signals the
+      ingester FIRST in shutdown so it stops pumping data into a store
+      no one is reading during the join window. CPU on hub_core drops
+      to 0 immediately on SIGTERM.
+- [x] O6: `hw.rs::default_l3_with_warning` — one-shot tracing::warn! fires
+      when L3 detection falls back to the 8 MiB default. Operators in
+      containers see "L3 detection failed: /sys unreadable" instead of
+      silently wrong store sizing.
+- [x] Q4: Phase 8 and Phase 9 reordered in this doc (Phase 8 came after
+      Phase 9 chronologically inverted — a cosmetic distraction).
+
+112 tests passing across 6 suites; cargo clippy --all-targets -D warnings: clean.
 
 ---
 

@@ -73,8 +73,14 @@ fn detect_l3_cache() -> usize {
     let l3 = sysctl_u64("hw.l3cachesize");
     if l3 > 0 { return l3 as usize; }
     let l2 = sysctl_u64("hw.l2cachesize");
-    if l2 > 0 { return l2 as usize; }
-    default_l3()
+    if l2 > 0 {
+        tracing::info!(
+            l2_bytes = l2,
+            "hw.l3cachesize unavailable on this CPU; using L2 as the cache budget proxy"
+        );
+        return l2 as usize;
+    }
+    default_l3_with_warning("L3 detection: both hw.l3cachesize and hw.l2cachesize sysctls failed")
 }
 
 #[cfg(target_os = "linux")]
@@ -91,13 +97,40 @@ fn detect_l3_cache() -> usize {
             return bytes;
         }
     }
-    default_l3()
+    default_l3_with_warning("L3 detection failed: /sys/devices/system/cpu/cpu0/cache/* unreadable \
+                             (containers/sandboxes often don't expose this). Falling back to default.")
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn detect_l3_cache() -> usize { default_l3() }
+fn detect_l3_cache() -> usize {
+    default_l3_with_warning("L3 detection: unsupported platform — using default")
+}
 
 fn default_l3() -> usize { 8 * 1024 * 1024 }
+
+/// Returns [`default_l3`] and emits a one-shot `tracing::warn!` so operators
+/// learn that hardware detection failed (e.g. running in a container that
+/// doesn't expose `/sys/devices/system/cpu`). Without this, the system
+/// silently uses the 8 MiB default and stores can be sized completely
+/// wrong with no diagnostic. Wins from the deep review (O6).
+fn default_l3_with_warning(reason: &str) -> usize {
+    use std::sync::OnceLock;
+    // One-shot — we don't want this warn firing repeatedly if the detection
+    // path is called multiple times.
+    static WARNED: OnceLock<()> = OnceLock::new();
+    if WARNED.set(()).is_ok() {
+        let bytes = default_l3();
+        tracing::warn!(
+            fallback_bytes = bytes,
+            reason,
+            "hardware L3 detection fell back to default — storage will be sized for {} MiB. \
+             If you're in a container, this is likely wrong; size max_symbols / ring_capacity \
+             manually via CandleStore::with_capacity.",
+            bytes / (1 << 20)
+        );
+    }
+    default_l3()
+}
 
 #[cfg(target_arch = "aarch64")]
 fn detect_cache_line() -> usize {

@@ -777,6 +777,21 @@ mod shm_impl {
             }
         }
 
+        /// Signal the ingester thread to exit at its next iteration —
+        /// without joining. Takes `&self` so it works through `Arc<Self>`
+        /// (the natural sharing pattern when multiple components — main,
+        /// metrics poller — hold the ingester).
+        ///
+        /// Use this at the START of shutdown to halt the ingester's hot
+        /// loop before the strategy/executor threads join. Without this,
+        /// the ingester keeps pumping data into a store no one is reading
+        /// during the join window — small CPU waste but visible in metrics.
+        /// The full join happens at [`Drop`](Self::drop), when the last
+        /// `Arc<ShmIngester>` clone is released.
+        pub fn stop_signal(&self) {
+            self.running.store(false, Ordering::Relaxed);
+        }
+
         /// Lifetime counter snapshot for metrics export.
         pub fn stats(&self) -> IngesterStats {
             IngesterStats {
