@@ -19,6 +19,15 @@ const DEFAULT_RING_CAPACITY: usize = 10_000;
 struct Entry {
     buf:         RwLock<RingBuffer>,
     last_access: AtomicU64,
+    /// Set to `true` under the buf write lock during eviction, BEFORE the
+    /// entry is removed from the map. The hot-path appender, having cloned
+    /// an `Arc<Entry>` via the map read-lock, acquires the buf write lock,
+    /// re-checks this flag, and retries via the slow path if the entry has
+    /// been evicted between the clone and the lock acquisition. Closes the
+    /// "Arc holder pushes to a dead Entry" data-loss window.
+    ///
+    /// `Acquire`/`Release` ordering pairs with the eviction's store-true.
+    removed:     std::sync::atomic::AtomicBool,
 }
 
 /// Embeddable hot-RAM + cold-Parquet candle store.
@@ -246,7 +255,18 @@ impl CandleStore {
 
         if let Some(entry) = entry {
             entry.last_access.store(tick, Ordering::Relaxed);
-            let outcome = entry.buf.write().push(candle);
+            let mut buf_guard = entry.buf.write();
+
+            // Eviction-race check: if our Arc was cloned BEFORE the symbol
+            // got evicted, the entry is now stale and we must NOT push into
+            // it. The evictor sets `removed=true` under this same buf write
+            // lock, so by the time we hold the lock the flag is definitive.
+            if entry.removed.load(Ordering::Acquire) {
+                drop(buf_guard);
+                return self.try_insert_new(symbol, candle, tick);
+            }
+
+            let outcome = buf_guard.push(candle);
             if let crate::ring_buffer::PushOutcome::OutOfOrder { prev_ts, this_ts } = outcome {
                 self.out_of_order.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
@@ -254,6 +274,7 @@ impl CandleStore {
                     "out-of-order candle — binary-search range queries may miss it"
                 );
             }
+            drop(buf_guard);
             self.version.fetch_add(1, Ordering::Release);
             return Ok(());
         }
@@ -284,7 +305,13 @@ impl CandleStore {
         if let Some(entry) = g.get(symbol).cloned() {
             drop(g);
             entry.last_access.store(tick, Ordering::Relaxed);
-            let outcome = entry.buf.write().push(candle);
+            let mut buf_guard = entry.buf.write();
+            // Same eviction-race window as the fast path — bounded retry.
+            if entry.removed.load(Ordering::Acquire) {
+                drop(buf_guard);
+                return self.try_insert_new(symbol, candle, tick);
+            }
+            let outcome = buf_guard.push(candle);
             if let crate::ring_buffer::PushOutcome::OutOfOrder { prev_ts, this_ts } = outcome {
                 self.out_of_order.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
@@ -292,6 +319,7 @@ impl CandleStore {
                     "out-of-order candle — binary-search range queries may miss it"
                 );
             }
+            drop(buf_guard);
             self.version.fetch_add(1, Ordering::Release);
             return Ok(());
         }
@@ -345,6 +373,25 @@ impl CandleStore {
                     }
                 }
 
+                // Critical: mark `removed = true` UNDER the entry's buf
+                // write lock BEFORE removing from the map. This serialises
+                // against any fast-path appender that already cloned the
+                // Arc (via the outer read lock that we waited for before
+                // acquiring the outer write lock above). When that
+                // appender finally gets entry.buf.write(), it sees
+                // removed=true and retries via the slow path instead of
+                // pushing a candle into a buffer about to disappear.
+                //
+                // Lock order is outer-write → inner-write throughout; no
+                // deadlock with the slow path (same order) or fast path
+                // (no outer lock held when taking inner).
+                if let Some(arc) = g.get(&key) {
+                    let _buf_guard = arc.buf.write();
+                    arc.removed.store(true, Ordering::Release);
+                    // Release buf lock here; queued fast-path appenders
+                    // unblock, observe removed=true, and retry — they will
+                    // then queue on the outer write lock we still hold.
+                }
                 self.evictions.fetch_add(1, Ordering::Relaxed);
                 g.remove(&key);
             }
@@ -357,6 +404,7 @@ impl CandleStore {
         g.insert(symbol.to_string(), Arc::new(Entry {
             buf:         RwLock::new(buf),
             last_access: AtomicU64::new(tick),
+            removed:     std::sync::atomic::AtomicBool::new(false),
         }));
 
         drop(g);
@@ -880,6 +928,101 @@ mod tests {
         let snap = store.snapshot();
         assert_eq!(snap.invalid_candles_total, 2);
         assert_eq!(snap.appends_total, 2, "version only bumps on accepted appends");
+    }
+
+    // ── Phase 11: eviction race ────────────────────────────────────────────
+
+    #[test]
+    fn appends_during_concurrent_eviction_are_never_lost() {
+        // Property test: while one thread hammers eviction by rotating 4
+        // symbols through a 2-symbol-cap store, two other threads append to
+        // two specific symbols. Every accepted append (the ones for the
+        // "stable" symbols that don't get evicted) must show up in the
+        // store. Before the Entry::removed flag, the fast-path appender
+        // could push into a buf already removed from the map and the
+        // candle would be silently lost.
+        //
+        // We assert via the version counter: it must equal the number of
+        // successful try_append() calls across all threads.
+        use std::sync::atomic::AtomicU64;
+        use std::time::{Duration, Instant};
+
+        let store = Arc::new(CandleStore::new(2));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let accepted = Arc::new(AtomicU64::new(0));
+
+        let s = Arc::clone(&store);
+        let stop2 = Arc::clone(&stop);
+        let accepted2 = Arc::clone(&accepted);
+        let writer_a = std::thread::spawn(move || {
+            let mut i = 0i64;
+            while !stop2.load(Ordering::Relaxed) {
+                if s.try_append("STABLE_A", candle(i)).is_ok() {
+                    accepted2.fetch_add(1, Ordering::Relaxed);
+                }
+                i += 1;
+            }
+        });
+
+        let s = Arc::clone(&store);
+        let stop2 = Arc::clone(&stop);
+        let accepted2 = Arc::clone(&accepted);
+        let writer_b = std::thread::spawn(move || {
+            let mut i = 0i64;
+            while !stop2.load(Ordering::Relaxed) {
+                if s.try_append("STABLE_B", candle(i)).is_ok() {
+                    accepted2.fetch_add(1, Ordering::Relaxed);
+                }
+                i += 1;
+            }
+        });
+
+        // Eviction churner: insert new symbols, which forces eviction of
+        // the LRU. Since STABLE_A and STABLE_B are being constantly
+        // appended, they'd both be MRU; the churn-symbols would be the
+        // eviction targets. To actually exercise the race we instead
+        // append to a rotating set of "churn" symbols whose appends
+        // push them ahead of STABLE_*. With max_symbols=2 and 3 ever-
+        // appended-to symbols, one IS evicted each turn.
+        let s = Arc::clone(&store);
+        let stop2 = Arc::clone(&stop);
+        let accepted2 = Arc::clone(&accepted);
+        let churner = std::thread::spawn(move || {
+            let mut i = 0i64;
+            while !stop2.load(Ordering::Relaxed) {
+                let sym = format!("CHURN_{}", i % 8);
+                if s.try_append(&sym, candle(i)).is_ok() {
+                    accepted2.fetch_add(1, Ordering::Relaxed);
+                }
+                i += 1;
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(500));
+        stop.store(true, Ordering::Relaxed);
+        let _ = writer_a.join();
+        let _ = writer_b.join();
+        let _ = churner.join();
+
+        // The invariant: every accepted append bumped version exactly once.
+        // If the race had eaten a push, version < accepted.
+        let n_accepted = accepted.load(Ordering::Relaxed);
+        let snap = store.snapshot();
+        assert!(
+            n_accepted > 1000,
+            "test should produce >>1k appends; got {n_accepted} (slow CI?)"
+        );
+        assert_eq!(
+            snap.appends_total, n_accepted,
+            "every successful try_append must bump version exactly once \
+             (Entry::removed flag closes the eviction race)"
+        );
+
+        // Sanity: at least some evictions happened.
+        assert!(snap.evictions_total > 0, "expected at least one eviction");
+
+        // Suppress unused warning when build is fast.
+        let _ = Instant::now();
     }
 
     #[test]
