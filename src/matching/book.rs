@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use thiserror::Error;
 use super::{
     event::{CancelReason, Fill, TradeEvent},
-    order::{Order, OrderType, Side},
+    order::{Order, OrderType, Side, QTY_REL_TOL},
 };
 
 /// Errors from order-book operations that cannot be carried as a Cancel event.
@@ -64,6 +64,22 @@ fn price_key(p: f64) -> u64 {
 
 fn key_price(k: u64) -> f64 { k as f64 / PRICE_SCALE }
 
+/// Validate an order's price (if priced) and quantity, independent of any
+/// book state. Quoted price = `None` is allowed (market orders); otherwise
+/// the price must pass [`try_price_key`]. Shared by [`OrderBook`] and
+/// [`PaperEngine`](super::paper::PaperEngine) so a poison order (NaN/Inf,
+/// non-positive qty) can never reach either matching path or the portfolio.
+pub(crate) fn validate_order(order: &Order) -> Result<(), BookError> {
+    if !order.qty.is_finite() || order.qty <= 0.0 {
+        return Err(BookError::QuantityInvalid(order.qty));
+    }
+    if let Some(p) = order.price {
+        // For market orders, price is None — skipped here.
+        try_price_key(p)?;
+    }
+    Ok(())
+}
+
 /// Price-time priority order book for one symbol.
 pub struct OrderBook {
     pub symbol: String,
@@ -76,26 +92,12 @@ impl OrderBook {
         Self { symbol: symbol.into(), bids: BTreeMap::new(), asks: BTreeMap::new() }
     }
 
-    /// Validate that an order's price (if priced) and quantity are
-    /// representable. Quoted price = `0.0` is allowed for market orders
-    /// (the convention) but otherwise the price must pass [`try_price_key`].
-    fn validate_order(&self, order: &Order) -> Result<(), BookError> {
-        if !order.qty.is_finite() || order.qty <= 0.0 {
-            return Err(BookError::QuantityInvalid(order.qty));
-        }
-        if let Some(p) = order.price {
-            // For market orders, price is None — skipped here.
-            try_price_key(p)?;
-        }
-        Ok(())
-    }
-
     /// Strict submit. Returns `Err(BookError)` on invalid input (NaN/Inf,
     /// negative, out of range). On success returns the trade events as
     /// usual. Prefer this anywhere the order comes from untrusted input —
     /// strategy outputs, FFI, user submissions.
     pub fn try_submit(&mut self, order: Order, ts: i64) -> Result<Vec<TradeEvent>, BookError> {
-        self.validate_order(&order)?;
+        validate_order(&order)?;
         Ok(self.submit_validated(order, ts))
     }
 
@@ -104,7 +106,7 @@ impl OrderBook {
     /// `BookError` variant in the log) rather than panicking. Existing
     /// callers (tests, internal demos) keep working but get the safety net.
     pub fn submit(&mut self, order: Order, ts: i64) -> Vec<TradeEvent> {
-        if let Err(e) = self.validate_order(&order) {
+        if let Err(e) = validate_order(&order) {
             tracing::error!(order_id = order.id, symbol = %self.symbol, error = %e,
                 "order rejected at submit — invalid price or quantity");
             return vec![TradeEvent::Cancel {
@@ -160,7 +162,11 @@ impl OrderBook {
                 self.bids.range(floor..).flat_map(|(_, q)| q).map(|o| o.remaining).sum()
             }
         };
-        avail >= needed - f64::EPSILON
+        // Relative tolerance: the old `avail >= needed - f64::EPSILON` was
+        // scale-wrong — summing resting quantities at ~1e3 leaves float
+        // residue ~1e-13, dwarfing EPSILON, so decimal-sufficient liquidity
+        // falsely rejected FOK orders. See `order::QTY_REL_TOL`.
+        avail >= needed * (1.0 - QTY_REL_TOL)
     }
 
     fn match_order(&mut self, order: &mut Order, events: &mut Vec<TradeEvent>, ts: i64) {
@@ -195,7 +201,9 @@ impl OrderBook {
         let book_side  = match taker.side { Side::Buy => &mut self.asks, Side::Sell => &mut self.bids };
         let level      = match book_side.get_mut(&key) { Some(l) => l, None => return };
 
-        while taker.remaining > f64::EPSILON {
+        // `is_filled` uses the relative-dust tolerance, so a taker holding
+        // only float residue stops matching instead of consuming makers.
+        while !taker.is_filled() {
             let maker = match level.front_mut() { Some(m) => m, None => break };
             let qty   = taker.remaining.min(maker.remaining);
 
@@ -310,6 +318,56 @@ mod tests {
         }).collect();
         // maker fill should be order 1 (FIFO)
         assert!(fills.contains(&1));
+    }
+
+    // ── float-dust tolerance at scale ──────────────────────────────────────
+    // Three chunks of qty/3 sum to slightly less than qty (residue ~qty·1e-16,
+    // e.g. ~5.7e-14 at qty=1e3 — far above f64::EPSILON). The old absolute
+    // epsilon checks broke on exactly this dust; the relative tolerance
+    // (`order::QTY_REL_TOL`) must absorb it at any scale.
+
+    #[test]
+    fn fok_fills_when_liquidity_is_decimal_sufficient_at_1e3() {
+        let mut book = OrderBook::new("BTC");
+        let chunk = 1_000.0 / 3.0;
+        for id in 1..=3 { book.submit(sell_limit(id, 50_000.0, chunk), 0); }
+        let events = book.submit(Order::fok(4, "BTC", Side::Buy, 50_000.0, 1_000.0, 0), 0);
+        assert!(events.iter().all(|e| e.is_fill()), "FOK must fill, got {events:?}");
+        assert!(book.best_ask().is_none(), "no ghost dust may rest on the book");
+    }
+
+    #[test]
+    fn fok_fills_when_liquidity_is_decimal_sufficient_at_1e6() {
+        let mut book = OrderBook::new("BTC");
+        let chunk = 1_000_000.0 / 3.0;
+        for id in 1..=3 { book.submit(sell_limit(id, 50_000.0, chunk), 0); }
+        let events = book.submit(Order::fok(4, "BTC", Side::Buy, 50_000.0, 1_000_000.0, 0), 0);
+        assert!(events.iter().all(|e| e.is_fill()), "FOK must fill, got {events:?}");
+        assert!(book.best_ask().is_none(), "no ghost dust may rest on the book");
+    }
+
+    #[test]
+    fn market_sweep_with_float_dust_is_not_cancelled() {
+        let mut book = OrderBook::new("BTC");
+        let chunk = 1_000.0 / 3.0;
+        for id in 1..=3 { book.submit(sell_limit(id, 50_000.0, chunk), 0); }
+        // Taker remainder after the sweep is pure dust — must NOT emit a
+        // spurious MarketNoLiquidity cancel.
+        let events = book.submit(buy_market(4, 1_000.0), 0);
+        assert!(events.iter().all(|e| e.is_fill()), "dust must not cancel, got {events:?}");
+        assert!(book.best_ask().is_none());
+    }
+
+    #[test]
+    fn fill_sequence_leaving_dust_marks_resting_order_filled() {
+        let mut book = OrderBook::new("BTC");
+        book.submit(buy_limit(1, 50_000.0, 1_000.0), 0);
+        let chunk = 1_000.0 / 3.0;
+        for id in 2..=4 { book.submit(sell_limit(id, 50_000.0, chunk), 0); }
+        // The resting bid now holds only float residue; the old absolute
+        // epsilon left it as a ghost order at best bid.
+        assert!(book.best_bid().is_none(), "dust bid must be swept off the book");
+        assert!(book.best_ask().is_none());
     }
 
     // ── price-quantization safety ──────────────────────────────────────────

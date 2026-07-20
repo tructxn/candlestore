@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use crate::Candle;
 use super::{
+    book::{validate_order, BookError},
     event::{CancelReason, Fill, TradeEvent},
     order::{Order, OrderId, OrderType, Side},
     portfolio::Portfolio,
@@ -28,7 +29,32 @@ impl PaperEngine {
         }
     }
 
-    pub fn submit(&mut self, mut order: Order) -> OrderId {
+    /// Strict submit. Validates price/qty with the same rules as
+    /// [`OrderBook::try_submit`](super::book::OrderBook::try_submit) and
+    /// returns `Err(BookError)` on NaN/Inf or non-positive input, so a
+    /// poison order can never rest as pending or reach the portfolio.
+    pub fn try_submit(&mut self, order: Order) -> Result<OrderId, BookError> {
+        validate_order(&order)?;
+        Ok(self.enqueue(order))
+    }
+
+    /// Fire-and-forget submit, mirroring [`OrderBook::submit`]'s safety net:
+    /// invalid orders (NaN/Inf price or qty, qty ≤ 0) are logged and dropped
+    /// — the returned id will never fill. Callers that need the rejection
+    /// should use [`Self::try_submit`].
+    pub fn submit(&mut self, order: Order) -> OrderId {
+        match self.try_submit(order) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(error = %e,
+                    "paper order rejected at submit — invalid price or quantity");
+                // Burn an id so the caller still gets a unique handle.
+                self.next_id.fetch_add(1, Ordering::Relaxed)
+            }
+        }
+    }
+
+    fn enqueue(&mut self, mut order: Order) -> OrderId {
         order.id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let id = order.id;
         self.pending.push(order);
@@ -77,8 +103,9 @@ impl PaperEngine {
             }
         }
 
-        // remove fully processed orders
-        self.pending.retain(|o| !o.is_filled() && o.remaining > f64::EPSILON);
+        // remove fully processed orders (`is_filled` covers cancelled orders
+        // too — their remaining is zeroed above)
+        self.pending.retain(|o| !o.is_filled());
         events
     }
 
@@ -171,5 +198,53 @@ mod tests {
         engine.on_candle("BTC", &candle(51_000.0, 52_000.0, 50_500.0, 51_500.0));
         // bought at 50_000, sold at 51_000 → realized P&L = 1_000
         assert_eq!(engine.portfolio.realized_pnl, 1_000.0);
+    }
+
+    // ── submit validation (poison orders must never reach the portfolio) ───
+
+    /// Runs a candle past the engine and asserts the poison order left no
+    /// trace: nothing pending, no events, portfolio untouched.
+    fn assert_no_trace(mut engine: PaperEngine) {
+        assert_eq!(engine.pending_count(), 0, "invalid order must not rest as pending");
+        let events = engine.on_candle("BTC", &candle(50_000.0, 51_000.0, 49_000.0, 50_500.0));
+        assert!(events.is_empty(), "invalid order must produce no events");
+        assert_eq!(engine.portfolio.cash, 100_000.0, "cash must be unchanged");
+        assert!(engine.portfolio.trades.is_empty(), "no trades may be recorded");
+    }
+
+    #[test]
+    fn submit_rejects_nan_qty() {
+        let mut engine = PaperEngine::new(100_000.0);
+        engine.submit(Order::market(0, "BTC", Side::Buy, f64::NAN, 0));
+        assert_no_trace(engine);
+    }
+
+    #[test]
+    fn submit_rejects_infinite_limit_price() {
+        let mut engine = PaperEngine::new(100_000.0);
+        engine.submit(Order::limit(0, "BTC", Side::Buy, f64::INFINITY, 1.0, 0));
+        assert_no_trace(engine);
+    }
+
+    #[test]
+    fn submit_rejects_non_positive_qty() {
+        let mut engine = PaperEngine::new(100_000.0);
+        engine.submit(Order::market(0, "BTC", Side::Buy, 0.0, 0));
+        engine.submit(Order::market(0, "BTC", Side::Sell, -1.0, 0));
+        assert_no_trace(engine);
+    }
+
+    #[test]
+    fn try_submit_returns_precise_book_error() {
+        let mut engine = PaperEngine::new(100_000.0);
+        assert!(matches!(
+            engine.try_submit(Order::market(0, "BTC", Side::Buy, f64::NAN, 0)),
+            Err(BookError::QuantityInvalid(_))
+        ));
+        assert!(matches!(
+            engine.try_submit(Order::limit(0, "BTC", Side::Buy, f64::INFINITY, 1.0, 0)),
+            Err(BookError::PriceNotFinite)
+        ));
+        assert_eq!(engine.pending_count(), 0);
     }
 }
