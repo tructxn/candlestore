@@ -34,32 +34,25 @@ pub const READY_MAGIC: u64 = 0x00CA_FECA_1D1E_5748;
 /// Apple M-series (and many modern x86) cache line = 128 bytes.
 const CACHE_LINE: usize = 128;
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-/// Returns the current time in nanoseconds since the UNIX epoch.
-#[inline]
-pub fn now_nanos() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as i64
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // SpscRing — heap-backed, in-process SPSC
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Aligned wrapper that places an `AtomicU64` cursor on its own 128-byte cache line,
-/// preventing false sharing between head and tail on wide-cache-line CPUs (Apple M-series).
+/// Aligned wrapper that places an `AtomicU64` counter on its own 128-byte cache line,
+/// preventing false sharing between adjacent hot counters on wide-cache-line CPUs
+/// (Apple M-series).
+///
+/// Shared crate-wide: used here for the SPSC head/tail cursors and by
+/// `store::CandleStore` to pad its globally-contended `version`/`tick` counters.
 #[repr(C, align(128))]
-struct CachePadded {
-    value: AtomicU64,
+pub(crate) struct CachePadded {
+    pub(crate) value: AtomicU64,
     #[allow(dead_code)]
     _pad: [u8; CACHE_LINE - 8], // AtomicU64 is 8 bytes; pad to 128
 }
 
 impl CachePadded {
-    const fn new(v: u64) -> Self {
+    pub(crate) const fn new(v: u64) -> Self {
         Self {
             value: AtomicU64::new(v),
             _pad: [0u8; CACHE_LINE - 8],
@@ -117,8 +110,10 @@ impl SpscRing {
     /// Panics if `capacity` is zero or not a power of two.
     #[allow(clippy::new_ret_no_self)]
     pub fn new<T: Copy + Default + Send>(capacity: usize) -> (SpscWriter<T>, SpscReader<T>) {
-        assert!(capacity.is_power_of_two(), "SpscRing capacity must be a power of two");
+        // Check zero FIRST: `is_power_of_two()` is false for 0, so the reverse
+        // order would report "must be a power of two" for a zero capacity.
         assert!(capacity > 0, "SpscRing capacity must be > 0");
+        assert!(capacity.is_power_of_two(), "SpscRing capacity must be a power of two");
 
         let slots: Box<[UnsafeCell<T>]> = (0..capacity)
             .map(|_| UnsafeCell::new(T::default()))

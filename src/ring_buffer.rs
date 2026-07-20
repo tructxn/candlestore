@@ -137,9 +137,10 @@ impl RingBuffer {
 
     // ── public API ───────────────────────────────────────────────────────────
 
-    /// Returns candles in chronological order (oldest first).
-    /// O(n) memcpy (one or two contiguous chunks).
-    pub fn as_slice(&self) -> Vec<Candle> {
+    /// Copy the entire logical contents into a fresh `Vec`, oldest first.
+    /// O(n) memcpy (one or two contiguous chunks). Named `to_vec` because it
+    /// allocates — a borrowed slice is impossible once the ring has wrapped.
+    pub fn to_vec(&self) -> Vec<Candle> {
         self.copy_logical_range(0, self.len)
     }
 
@@ -193,7 +194,7 @@ mod tests {
         let _ = rb.push(candle(1, 10.0));
         let _ = rb.push(candle(2, 20.0));
         let _ = rb.push(candle(3, 30.0));
-        let out = rb.as_slice();
+        let out = rb.to_vec();
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].ts, 1);
         assert_eq!(out[2].ts, 3);
@@ -206,7 +207,7 @@ mod tests {
         let _ = rb.push(candle(2, 20.0));
         let _ = rb.push(candle(3, 30.0));
         let _ = rb.push(candle(4, 40.0)); // evicts ts=1
-        let out = rb.as_slice();
+        let out = rb.to_vec();
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].ts, 2);
         assert_eq!(out[2].ts, 4);

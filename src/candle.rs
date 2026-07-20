@@ -1,4 +1,10 @@
-/// OHLCV candle — 48 bytes, cache-line friendly.
+/// OHLCV candle — 48 bytes, `#[repr(C)]`.
+///
+/// Layout trade-off: a 48-byte stride packs arrays ~25% denser in L3 than a
+/// cache-line-padded 64-byte layout, at the cost that half of consecutive
+/// candles straddle a 64-byte line boundary. For the scan-heavy access
+/// patterns here (range copies, rolling SMA windows) density wins; random
+/// single-candle access occasionally pays an extra line fill.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[repr(C)]
 pub struct Candle {

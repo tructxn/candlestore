@@ -6,7 +6,7 @@ use hashbrown::HashMap;
 use parking_lot::RwLock;
 use thiserror::Error;
 
-use crate::{Candle, hw::HardwareProfile, parquet, ring_buffer::RingBuffer};
+use crate::{Candle, hw::HardwareProfile, parquet, ring_buffer::RingBuffer, shm::CachePadded};
 
 const DEFAULT_RING_CAPACITY: usize = 10_000;
 
@@ -49,7 +49,8 @@ struct Entry {
 /// # Observability
 ///
 /// Internal atomic counters track lifetime totals for appends (via
-/// [`version`](Self::version)), evictions, and Parquet spill outcomes. Cheap to update
+/// [`version`](Self::version) minus wake-up signals), evictions, and Parquet
+/// spill outcomes. Cheap to update
 /// (single `fetch_add`) so the hot path stays sub-microsecond. The application
 /// reads these via [`snapshot`](Self::snapshot) on a low-frequency timer (e.g.
 /// every second) and feeds them to its metrics pipeline; the library itself
@@ -62,14 +63,27 @@ pub struct CandleStore {
     ring_capacity: usize,
     data_dir:      Option<PathBuf>,
 
-    /// Monotonic append counter — bumped on every `append()` regardless of
-    /// symbol. Consumers spin on this to detect new candles without polling
-    /// on a wall-clock timer. u64 at 1M appends/sec wraps in ~585,000 years.
-    version: AtomicU64,
+    /// Monotonic change counter — bumped on every accepted `append()` (any
+    /// symbol) and once per [`signal_waiters`](Self::signal_waiters) wake-up.
+    /// Consumers spin on this to detect new candles without polling on a
+    /// wall-clock timer. u64 at 1M appends/sec wraps in ~585,000 years.
+    ///
+    /// Cache-padded: `version` and `tick` are both hit on every append by
+    /// every producer thread; unpadded they'd share one cache line and
+    /// false-share. Kept as two counters — they have different semantics
+    /// (`version` bumps only on accepted appends, `tick` on all attempts).
+    version: CachePadded,
 
     /// Monotonic logical clock for the approximate LRU. Bumped on every
-    /// `append()`, stored into the touched entry's `last_access`.
-    tick: AtomicU64,
+    /// `append()` attempt, stored into the touched entry's `last_access`.
+    /// Cache-padded — see [`version`](field@Self::version).
+    tick: CachePadded,
+
+    /// Lifetime [`signal_waiters`](Self::signal_waiters) calls. Each one also
+    /// bumps `version` (that IS the wake mechanism), so `snapshot()` reports
+    /// `appends_total = version - signals` to keep the metric honest.
+    /// Cold path — no padding needed.
+    signals: AtomicU64,
 
     /// Lifetime evictions count — bumped each time an LRU symbol is removed.
     evictions: AtomicU64,
@@ -137,7 +151,8 @@ pub enum AppendError {
 /// publishes Prometheus / OpenTelemetry / etc. counters.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StoreSnapshot {
-    /// Lifetime append count (== `version`).
+    /// Lifetime accepted-append count (`version` minus `signal_waiters()`
+    /// wake-ups, which also bump `version` as their wake mechanism).
     pub appends_total:              u64,
     /// Currently active symbols (in RAM).
     pub symbol_count:               usize,
@@ -181,8 +196,9 @@ impl CandleStore {
             max_symbols,
             ring_capacity,
             data_dir:             None,
-            version:              AtomicU64::new(0),
-            tick:                 AtomicU64::new(0),
+            version:              CachePadded::new(0),
+            tick:                 CachePadded::new(0),
+            signals:              AtomicU64::new(0),
             evictions:            AtomicU64::new(0),
             parquet_spill_bytes:  AtomicU64::new(0),
             parquet_spill_errors: AtomicU64::new(0),
@@ -242,7 +258,7 @@ impl CandleStore {
             return Err(AppendError::InvalidCandle { symbol: symbol.to_owned() });
         }
 
-        let tick = self.tick.fetch_add(1, Ordering::Relaxed);
+        let tick = self.tick.value.fetch_add(1, Ordering::Relaxed);
 
         // ── fast path: symbol already exists ──────────────────────────────────
         // Read-lock the outer map, clone the Arc, release outer lock. The
@@ -255,32 +271,42 @@ impl CandleStore {
 
         if let Some(entry) = entry {
             entry.last_access.store(tick, Ordering::Relaxed);
-            let mut buf_guard = entry.buf.write();
-
-            // Eviction-race check: if our Arc was cloned BEFORE the symbol
-            // got evicted, the entry is now stale and we must NOT push into
-            // it. The evictor sets `removed=true` under this same buf write
-            // lock, so by the time we hold the lock the flag is definitive.
-            if entry.removed.load(Ordering::Acquire) {
-                drop(buf_guard);
-                return self.try_insert_new(symbol, candle, tick);
+            if self.push_and_publish(&entry, symbol, candle) {
+                return Ok(());
             }
-
-            let outcome = buf_guard.push(candle);
-            if let crate::ring_buffer::PushOutcome::OutOfOrder { prev_ts, this_ts } = outcome {
-                self.out_of_order.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    symbol, prev_ts, this_ts,
-                    "out-of-order candle — binary-search range queries may miss it"
-                );
-            }
-            drop(buf_guard);
-            self.version.fetch_add(1, Ordering::Release);
-            return Ok(());
+            // Entry was evicted between the Arc clone and the buf lock —
+            // retry via the slow path (queues on the outer write lock).
+            return self.try_insert_new(symbol, candle, tick);
         }
 
         // ── slow path: insert (and possibly evict) ────────────────────────────
         self.try_insert_new(symbol, candle, tick)
+    }
+
+    /// Push `candle` into a live entry's ring under its write lock, count an
+    /// out-of-order ts, then publish the append by bumping `version`. Shared
+    /// by the fast path and the insert-race path so the two can't drift.
+    ///
+    /// Returns `false` — WITHOUT pushing or bumping `version` — if the entry
+    /// was evicted before we acquired the buf lock. The evictor sets
+    /// `Entry::removed` under this same lock, so by the time we hold it the
+    /// flag is definitive; the caller must retry via the slow path.
+    fn push_and_publish(&self, entry: &Entry, symbol: &str, candle: Candle) -> bool {
+        let mut buf_guard = entry.buf.write();
+        if entry.removed.load(Ordering::Acquire) {
+            return false;
+        }
+        let outcome = buf_guard.push(candle);
+        if let crate::ring_buffer::PushOutcome::OutOfOrder { prev_ts, this_ts } = outcome {
+            self.out_of_order.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                symbol, prev_ts, this_ts,
+                "out-of-order candle — binary-search range queries may miss it"
+            );
+        }
+        drop(buf_guard);
+        self.version.value.fetch_add(1, Ordering::Release);
+        true
     }
 
     /// Insert a new symbol. May evict the LRU symbol if `max_symbols` is hit.
@@ -298,6 +324,17 @@ impl CandleStore {
     /// is paid infrequently. Size `max_symbols` to exceed your active symbol
     /// count to avoid eviction entirely.
     fn try_insert_new(&self, symbol: &str, candle: Candle, tick: u64) -> Result<(), AppendError> {
+        // Allocate (and zero-init) the new ring BEFORE taking the outer write
+        // lock — at the default capacity that's ~480 KB of memset which would
+        // otherwise stall every append and read in the store. Trade-off: the
+        // race-check path below (another thread inserted the symbol first)
+        // wastes the allocation — rare, acceptable.
+        //
+        // First push of a new RingBuffer is always Ok (no prior ts to compare
+        // against) — discard the outcome.
+        let mut buf = RingBuffer::new(self.ring_capacity);
+        let _ = buf.push(candle);
+
         let mut g = self.map.write();
 
         // Race check: another thread may have inserted the same symbol while
@@ -305,23 +342,11 @@ impl CandleStore {
         if let Some(entry) = g.get(symbol).cloned() {
             drop(g);
             entry.last_access.store(tick, Ordering::Relaxed);
-            let mut buf_guard = entry.buf.write();
+            if self.push_and_publish(&entry, symbol, candle) {
+                return Ok(());
+            }
             // Same eviction-race window as the fast path — bounded retry.
-            if entry.removed.load(Ordering::Acquire) {
-                drop(buf_guard);
-                return self.try_insert_new(symbol, candle, tick);
-            }
-            let outcome = buf_guard.push(candle);
-            if let crate::ring_buffer::PushOutcome::OutOfOrder { prev_ts, this_ts } = outcome {
-                self.out_of_order.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    symbol, prev_ts, this_ts,
-                    "out-of-order candle — binary-search range queries may miss it"
-                );
-            }
-            drop(buf_guard);
-            self.version.fetch_add(1, Ordering::Release);
-            return Ok(());
+            return self.try_insert_new(symbol, candle, tick);
         }
 
         // Eviction if we're at capacity. Spill happens INSIDE the lock so
@@ -332,9 +357,23 @@ impl CandleStore {
                 .map(|(k, _)| k.clone());
 
             if let Some(key) = evict_key {
-                // Snapshot the candidate's data — entry is still in the map.
+                // Mark `removed = true` and snapshot the ring under ONE buf
+                // write lock acquisition. Ordering matters: any fast-path
+                // appender that cloned this Arc before we took the outer
+                // write lock is not blocked by that lock — it only queues on
+                // `entry.buf.write()`. By flagging before we copy, the next
+                // thing such an appender observes under the buf lock is
+                // removed=true, so it re-routes to the slow path (queuing on
+                // the outer write lock we hold) instead of pushing into a
+                // snapshot we've already taken. Flagging AFTER the snapshot
+                // (the previous implementation) left the whole spill-I/O
+                // window open for appends that were neither spilled nor kept.
                 let candles_to_spill = g.get(&key)
-                    .map(|e| e.buf.read().as_slice())
+                    .map(|e| {
+                        let buf_guard = e.buf.write();
+                        e.removed.store(true, Ordering::Release);
+                        buf_guard.to_vec()
+                    })
                     .unwrap_or_default();
 
                 if !candles_to_spill.is_empty() {
@@ -350,7 +389,14 @@ impl CandleStore {
                             }
                             Err(e) => {
                                 // Failure path: entry is STILL in the map.
-                                // Leave it there. The caller decides what to do.
+                                // Leave it there — but clear `removed`, or
+                                // the live entry becomes poison: every
+                                // appender would see removed=true, re-enter
+                                // the slow path, find the entry in the map,
+                                // and recurse forever.
+                                if let Some(arc) = g.get(&key) {
+                                    arc.removed.store(false, Ordering::Release);
+                                }
                                 self.parquet_spill_errors.fetch_add(1, Ordering::Relaxed);
                                 tracing::error!(
                                     symbol = %key, candles = candles_to_spill.len(), error = %e,
@@ -373,34 +419,19 @@ impl CandleStore {
                     }
                 }
 
-                // Critical: mark `removed = true` UNDER the entry's buf
-                // write lock BEFORE removing from the map. This serialises
-                // against any fast-path appender that already cloned the
-                // Arc (via the outer read lock that we waited for before
-                // acquiring the outer write lock above). When that
-                // appender finally gets entry.buf.write(), it sees
-                // removed=true and retries via the slow path instead of
-                // pushing a candle into a buffer about to disappear.
+                // `removed` was already set (under the buf write lock)
+                // before the snapshot above, so no append can have landed
+                // between what we spilled and this removal.
                 //
                 // Lock order is outer-write → inner-write throughout; no
                 // deadlock with the slow path (same order) or fast path
                 // (no outer lock held when taking inner).
-                if let Some(arc) = g.get(&key) {
-                    let _buf_guard = arc.buf.write();
-                    arc.removed.store(true, Ordering::Release);
-                    // Release buf lock here; queued fast-path appenders
-                    // unblock, observe removed=true, and retry — they will
-                    // then queue on the outer write lock we still hold.
-                }
                 self.evictions.fetch_add(1, Ordering::Relaxed);
                 g.remove(&key);
             }
         }
 
-        // Now safe to insert the new symbol. First push of a new RingBuffer
-        // is always Ok (no prior ts to compare against) — discard outcome.
-        let mut buf = RingBuffer::new(self.ring_capacity);
-        let _ = buf.push(candle);
+        // Now safe to insert the new symbol (ring pre-allocated above).
         g.insert(symbol.to_string(), Arc::new(Entry {
             buf:         RwLock::new(buf),
             last_access: AtomicU64::new(tick),
@@ -408,7 +439,7 @@ impl CandleStore {
         }));
 
         drop(g);
-        self.version.fetch_add(1, Ordering::Release);
+        self.version.value.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -471,7 +502,7 @@ impl CandleStore {
     /// polling `range()` on a wall-clock timer.
     #[inline]
     pub fn version(&self) -> u64 {
-        self.version.load(Ordering::Acquire)
+        self.version.value.load(Ordering::Acquire)
     }
 
     /// Atomic counter snapshot for metrics export.
@@ -481,8 +512,12 @@ impl CandleStore {
     /// Prometheus / OpenTelemetry counters. The library never emits metrics
     /// on the hot path itself.
     pub fn snapshot(&self) -> StoreSnapshot {
+        // `signal_waiters` bumps `signals` BEFORE `version`, so a snapshot
+        // racing a signal may transiently observe signals > append-adjusted
+        // version — saturate rather than wrap.
         StoreSnapshot {
-            appends_total:              self.version.load(Ordering::Relaxed),
+            appends_total:              self.version.value.load(Ordering::Relaxed)
+                                            .saturating_sub(self.signals.load(Ordering::Relaxed)),
             symbol_count:               self.map.read().len(),
             max_symbols:                self.max_symbols,
             ring_capacity:              self.ring_capacity,
@@ -504,7 +539,7 @@ impl CandleStore {
     #[inline]
     pub fn wait_for_change(&self, last_seen: u64) -> u64 {
         loop {
-            let v = self.version.load(Ordering::Acquire);
+            let v = self.version.value.load(Ordering::Acquire);
             if v != last_seen { return v; }
             std::hint::spin_loop();
         }
@@ -518,9 +553,15 @@ impl CandleStore {
     /// observe their own shutdown signal and exit cleanly. No data lost, no
     /// false signal — the consumer simply wakes, sees no new candles, checks
     /// its shutdown flag, and breaks out of its loop.
+    ///
+    /// Also bumps `signals` so `snapshot()` can report an honest
+    /// `appends_total` (`version - signals`). `signals` goes first: a racing
+    /// snapshot then at worst under-reports by one transiently (saturated),
+    /// never over-counts an append that didn't happen.
     #[inline]
     pub fn signal_waiters(&self) {
-        self.version.fetch_add(1, Ordering::Release);
+        self.signals.fetch_add(1, Ordering::Relaxed);
+        self.version.value.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -534,7 +575,9 @@ fn merge_by_ts(a: Vec<Candle>, b: Vec<Candle>) -> Vec<Candle> {
         match a[ai].ts.cmp(&b[bi].ts) {
             std::cmp::Ordering::Less    => { out.push(a[ai]); ai += 1; }
             std::cmp::Ordering::Greater => { out.push(b[bi]); bi += 1; }
-            std::cmp::Ordering::Equal   => { out.push(a[ai]); ai += 1; bi += 1; } // prefer cold
+            // On a ts collision prefer hot (`b`): it's the more recently
+            // ingested — possibly corrected — value; cold is a stale spill.
+            std::cmp::Ordering::Equal   => { out.push(b[bi]); ai += 1; bi += 1; }
         }
     }
     out.extend_from_slice(&a[ai..]);
@@ -693,6 +736,42 @@ mod tests {
         assert_eq!(result.len(), 10);
         assert_eq!(result[0].ts, 0);
         assert_eq!(result[9].ts, 9);
+    }
+
+    #[test]
+    fn merge_prefers_hot_over_cold_on_ts_collision() {
+        // The same ts exists both in a cold spill and in hot RAM (a late
+        // correction re-ingested after eviction). Hot must win: it's the
+        // more recently ingested value.
+        let dir = tempfile::tempdir().unwrap();
+        let store = CandleStore::new(4).with_data_dir(dir.path());
+
+        // Cold: ts=100 with close=1.0, spilled directly to the symbol's dir.
+        let mut cold = candle(100);
+        cold.close = 1.0;
+        parquet::spill(dir.path(), "BTC", &[cold]).unwrap();
+
+        // Hot: ts=100 with the corrected close=2.0.
+        let mut hot = candle(100);
+        hot.close = 2.0;
+        store.append("BTC", hot);
+
+        let merged = store.range("BTC", 0, 1_000);
+        assert_eq!(merged.len(), 1, "equal ts must dedup to one candle");
+        assert_eq!(merged[0].close, 2.0, "hot (recent) value must win over cold spill");
+    }
+
+    #[test]
+    fn signal_waiters_does_not_inflate_appends_total() {
+        let store = CandleStore::new(4);
+        store.append("BTC", candle(1));
+        store.signal_waiters();
+        store.signal_waiters();
+
+        // version still advances (that IS the wake mechanism)...
+        assert_eq!(store.version(), 3);
+        // ...but the metrics stay honest: only one real append happened.
+        assert_eq!(store.snapshot().appends_total, 1);
     }
 
     // ── new: concurrency tests for per-symbol locking ────────────────────────
@@ -1023,6 +1102,73 @@ mod tests {
 
         // Suppress unused warning when build is fast.
         let _ = Instant::now();
+    }
+
+    #[test]
+    fn appends_landing_during_spill_window_are_spilled_or_kept() {
+        // Conservation test for the snapshot-window race: the evictor used
+        // to snapshot the ring, release the buf lock, do slow Parquet I/O,
+        // and only THEN set `removed=true`. A fast-path append landing in
+        // that window bumped `version` (so the version==accepted invariant
+        // above can't see it) but was neither in the snapshot nor kept —
+        // destroyed at `g.remove()`.
+        //
+        // Here we count actual candles instead: every accepted VICTIM
+        // append must be retrievable afterwards from hot RAM + cold
+        // Parquet combined. The VICTIM appender is paced and bounded below
+        // ring capacity so wrap-around can never legitimately drop data.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(CandleStore::new(2).with_data_dir(dir.path()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Churner: rotate 8 symbols through a 2-cap store to force constant
+        // evictions; the slow VICTIM appender is frequently the LRU.
+        let s = Arc::clone(&store);
+        let stop2 = Arc::clone(&stop);
+        let churner = std::thread::spawn(move || {
+            let mut i = 0i64;
+            while !stop2.load(Ordering::Relaxed) {
+                let _ = s.try_append(&format!("CHURN_{}", i % 8), candle(i));
+                i += 1;
+            }
+        });
+
+        // VICTIM appender: unique monotonic ts, paced so total appends stay
+        // far below ring_capacity (10k) — the ring can never wrap between
+        // evictions, so any missing candle is a genuine race loss.
+        let mut accepted_ts: Vec<i64> = Vec::new();
+        for i in 0..4_000i64 {
+            if store.try_append("VICTIM", candle(i)).is_ok() {
+                accepted_ts.push(i);
+            }
+            if i % 8 == 0 {
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            } else {
+                std::thread::yield_now();
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = churner.join();
+
+        let snap = store.snapshot();
+        assert!(snap.evictions_total > 0, "expected at least one eviction");
+
+        // Hot + cold merged view must contain every accepted candle.
+        let got = store.range("VICTIM", 0, i64::MAX);
+        let got_ts: std::collections::HashSet<i64> = got.iter().map(|c| c.ts).collect();
+        let missing: Vec<i64> = accepted_ts
+            .iter()
+            .copied()
+            .filter(|ts| !got_ts.contains(ts))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} accepted VICTIM candles vanished (neither hot nor spilled): \
+             first few missing ts = {:?}",
+            missing.len(),
+            &missing[..missing.len().min(10)]
+        );
     }
 
     #[test]

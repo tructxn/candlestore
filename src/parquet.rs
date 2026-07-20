@@ -151,10 +151,21 @@ pub fn cold_file_path(data_dir: &Path, symbol: &str, ts_start: i64, ts_end: i64)
 }
 
 /// Parse ts_start / ts_end from a cold file name.
+///
+/// Accepts both the plain `{start}_{end}` stem and the collision-suffixed
+/// `{start}_{end}-{n}` form written by [`spill`] when the plain name already
+/// exists (see the collision handling there).
 fn parse_ts_range(path: &Path) -> Option<(i64, i64)> {
     let stem = path.file_stem()?.to_str()?;
     let (a, b) = stem.split_once('_')?;
-    Some((a.parse().ok()?, b.parse().ok()?))
+    let end = b.parse().ok().or_else(|| {
+        // "{end}-{n}" collision suffix — strip it. rsplit keeps a leading
+        // '-' (negative ts) attached to the number it belongs to.
+        let (base, n) = b.rsplit_once('-')?;
+        n.parse::<u32>().ok()?;
+        base.parse().ok()
+    })?;
+    Some((a.parse().ok()?, end))
 }
 
 // ── write ─────────────────────────────────────────────────────────────────────
@@ -162,11 +173,29 @@ fn parse_ts_range(path: &Path) -> Option<(i64, i64)> {
 pub fn spill(data_dir: &Path, symbol: &str, candles: &[Candle]) -> Result<(), SpillError> {
     if candles.is_empty() { return Ok(()); }
 
-    let ts_start = candles.first().unwrap().ts;
-    let ts_end   = candles.last().unwrap().ts;
-    let path     = cold_file_path(data_dir, symbol, ts_start, ts_end);
+    // The store accepts out-of-order candles, so first/last are NOT
+    // necessarily min/max. The filename range is what `query_cold` prunes
+    // against — computing it from first/last would let an interior extreme
+    // ts fall outside the advertised range and be permanently skipped.
+    let mut ts_start = candles[0].ts;
+    let mut ts_end   = candles[0].ts;
+    for c in &candles[1..] {
+        ts_start = ts_start.min(c.ts);
+        ts_end   = ts_end.max(c.ts);
+    }
+    let mut path = cold_file_path(data_dir, symbol, ts_start, ts_end);
 
     fs::create_dir_all(path.parent().unwrap())?;
+
+    // `File::create` truncates — a re-spill of an identical {start}_{end}
+    // range would silently destroy the earlier file's data. Append a "-{n}"
+    // suffix until the name is free (TOCTOU-safe enough: spills for one
+    // symbol are serialised under the store's outer write lock).
+    let mut n = 1u32;
+    while path.exists() {
+        path = path.with_file_name(format!("{ts_start}_{ts_end}-{n}.parquet"));
+        n += 1;
+    }
 
     let schema = candle_schema();
 
@@ -272,6 +301,12 @@ pub fn query_cold(data_dir: &Path, symbol: &str, from_ts: i64, to_ts: i64) -> Ve
     }
 
     out.sort_unstable_by_key(|c| c.ts);
+    // Cross-file dedup: collision-suffixed re-spills (and overlapping spill
+    // windows) can store the same ts in multiple files. Keep the FIRST
+    // occurrence after the sort — among equal-ts duplicates the survivor is
+    // unspecified (`sort_unstable`), which is acceptable because duplicates
+    // are byte-identical in the non-pathological case.
+    out.dedup_by_key(|c| c.ts);
     out
 }
 
@@ -325,6 +360,78 @@ mod tests {
         let result = query_cold(dir.path(), "SOL/USDT:1m", 100 * 60_000, 104 * 60_000);
         assert_eq!(result.len(), 5);
         assert!(result.iter().all(|c| c.close == 200.0));
+    }
+
+    #[test]
+    fn spill_filename_uses_min_max_ts_not_first_last() {
+        // Out-of-order slice: first=100, last=200, but the interior candle
+        // has the maximum ts (500). A first/last-derived filename "100_200"
+        // would be pruned for the query window [400, 600] and the interior
+        // candle lost to every future query.
+        let dir = tempfile::tempdir().unwrap();
+        let ooo = vec![candle(100, 1.0), candle(500, 2.0), candle(200, 3.0)];
+        spill(dir.path(), "OOO/USDT:1m", &ooo).unwrap();
+
+        let result = query_cold(dir.path(), "OOO/USDT:1m", 400, 600);
+        assert_eq!(result.len(), 1, "interior-max candle must survive filename pruning");
+        assert_eq!(result[0].ts, 500);
+
+        // And the file actually advertises the true min/max range.
+        assert!(
+            cold_file_path(dir.path(), "OOO/USDT:1m", 100, 500).exists(),
+            "filename must be {{min}}_{{max}}, not {{first}}_{{last}}"
+        );
+    }
+
+    #[test]
+    fn spill_does_not_truncate_on_filename_collision() {
+        // Two spills with identical (min, max) ts collide on "0_10.parquet".
+        // Without collision avoidance the second File::create truncates the
+        // first — ts=4 would vanish.
+        let dir = tempfile::tempdir().unwrap();
+        let first:  Vec<_> = [0i64, 4, 10].iter().map(|&t| candle(t, 1.0)).collect();
+        let second: Vec<_> = [0i64, 6, 10].iter().map(|&t| candle(t, 2.0)).collect();
+        spill(dir.path(), "COLL", &first).unwrap();
+        spill(dir.path(), "COLL", &second).unwrap();
+
+        let sym_dir = dir.path().join("COLL");
+        let files: Vec<_> = fs::read_dir(&sym_dir).unwrap().flatten().collect();
+        assert_eq!(files.len(), 2, "second spill must land in a new file");
+
+        let result = query_cold(dir.path(), "COLL", 0, 10);
+        let ts: Vec<i64> = result.iter().map(|c| c.ts).collect();
+        assert_eq!(ts, vec![0, 4, 6, 10], "both spills' unique ts survive, shared ts deduped");
+    }
+
+    #[test]
+    fn query_cold_dedups_equal_ts_across_files() {
+        // Overlapping spill windows store ts=60_000..=120_000 twice. The
+        // merged result must contain each ts exactly once.
+        let dir = tempfile::tempdir().unwrap();
+        let a: Vec<_> = (0..=2).map(|i| candle(i * 60_000, 1.0)).collect();
+        let b: Vec<_> = (1..=3).map(|i| candle(i * 60_000, 1.0)).collect();
+        spill(dir.path(), "DUP", &a).unwrap();
+        spill(dir.path(), "DUP", &b).unwrap();
+
+        let result = query_cold(dir.path(), "DUP", 0, i64::MAX);
+        let ts: Vec<i64> = result.iter().map(|c| c.ts).collect();
+        assert_eq!(ts, vec![0, 60_000, 120_000, 180_000], "no duplicate ts in merged view");
+    }
+
+    #[test]
+    fn collision_suffixed_files_still_prune_by_ts_range() {
+        // The "-{n}" suffix must not break parse_ts_range — a suffixed file
+        // outside the query window is pruned, one inside is read.
+        let dir = tempfile::tempdir().unwrap();
+        let batch: Vec<_> = [0i64, 10].iter().map(|&t| candle(t, 1.0)).collect();
+        spill(dir.path(), "SFX", &batch).unwrap();
+        spill(dir.path(), "SFX", &batch).unwrap(); // → 0_10-1.parquet
+        assert!(dir.path().join("SFX").join("0_10-1.parquet").exists());
+
+        // Window overlapping [0, 10] sees the (deduped) data...
+        assert_eq!(query_cold(dir.path(), "SFX", 0, 5).len(), 1);
+        // ...a disjoint window sees nothing (both files pruned by name).
+        assert!(query_cold(dir.path(), "SFX", 100, 200).is_empty());
     }
 
     #[test]
