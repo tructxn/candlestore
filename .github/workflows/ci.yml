@@ -62,7 +62,34 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --no-deps --all-features
 
-  # ── 4. Security advisory scan ─────────────────────────────────────────────
+  # ── 4. ThreadSanitizer on the concurrency tests ──────────────────────────
+  # The store's eviction races, the seqlock-style SHM rings, and ~30 unsafe
+  # sites in shm.rs are exactly the code TSan exists for. Requires nightly
+  # (-Zsanitizer) plus -Zbuild-std so std itself is instrumented.
+  #
+  # Non-blocking (continue-on-error): TSan on Rust is known to produce
+  # occasional false positives with lock-free code and adds ~10x runtime.
+  # Treat a red run as a strong hint to investigate, not a merge blocker.
+  # Promote to blocking once it has a track record of staying green.
+  tsan:
+    name: thread-sanitizer (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test under TSan
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread"
+          RUSTDOCFLAGS: "-Zsanitizer=thread"
+          TSAN_OPTIONS: "halt_on_error=1"
+        run: |
+          cargo test --lib -Zbuild-std --target x86_64-unknown-linux-gnu --release
+
+  # ── 5. Security advisory scan ─────────────────────────────────────────────
   # We run `cargo audit` directly rather than via rustsec/audit-check@v2 for
   # two reasons:
   #   1. The action treats informational warnings (e.g. "crate X is now
