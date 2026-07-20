@@ -30,6 +30,7 @@ func main() {
 	// ── SMA crossover strategy ────────────────────────────────────────────────
 	cash     := 100_000.0
 	position := 0.0
+	avgCost  := 0.0 // average entry price of the open position
 	realized := 0.0
 	trades   := 0
 	prevSignal := 0 // 0=none, 1=long, -1=short
@@ -50,15 +51,16 @@ func main() {
 			switch {
 			case signal == 1 && position == 0:
 				position = qty
+				avgCost = c.Open
 				cash -= qty * c.Open
-				fmt.Printf("[BUY ] ts=%-18d qty=%.4f @ $%.2f\n", c.Ts, qty, c.Open)
+				fmt.Printf("[BUY ] ts=%-19d qty=%.4f @ $%.2f\n", c.Ts, qty, c.Open)
 				trades++
 			case signal == -1 && position > 0:
-				realized += position * (c.Open - cash/position*-1)
-				pnl := (c.Open - (100_000.0-cash)/position) * position
+				pnl := (c.Open - avgCost) * position
+				realized += pnl
 				cash += position * c.Open
 				position = 0
-				fmt.Printf("[SELL] ts=%-18d qty=%.4f @ $%.2f  pnl=$%.2f\n", c.Ts, qty, c.Open, pnl)
+				fmt.Printf("[SELL] ts=%-19d qty=%.4f @ $%.2f  pnl=$%.2f\n", c.Ts, qty, c.Open, pnl)
 				trades++
 			}
 			prevSignal = signal
@@ -68,8 +70,9 @@ func main() {
 	// close open position
 	if position > 0 {
 		last := candles[len(candles)-1]
+		realized += (last.Close - avgCost) * position
 		cash += position * last.Close
-		fmt.Printf("[CLOS] ts=%-18d qty=%.4f @ $%.2f\n", last.Ts, position, last.Close)
+		fmt.Printf("[CLOS] ts=%-19d qty=%.4f @ $%.2f\n", last.Ts, position, last.Close)
 		trades++
 		position = 0
 	}
@@ -77,8 +80,8 @@ func main() {
 	fmt.Printf("\n─── Results ─────────────────────────────────────────\n")
 	fmt.Printf("Trades:   %d\n", trades)
 	fmt.Printf("Cash:     $%.2f\n", cash)
+	fmt.Printf("Realized: $%.2f\n", realized)
 	fmt.Printf("P&L:      $%.2f\n", cash-100_000.0)
-	_ = realized
 }
 
 func sma(candles []cs.Candle) float64 {
@@ -90,7 +93,7 @@ func sma(candles []cs.Candle) float64 {
 func syntheticCandles(n int) []cs.Candle {
 	candles := make([]cs.Candle, n)
 	price   := 50_000.0
-	ts      := int64(1_700_000_000_000)
+	ts      := int64(1_700_000_000_000_000_000) // unix ns
 	for i := range candles {
 		trend := math.Sin(float64(i)*0.08) * 500.0
 		noise := math.Sin(float64(i)*1.7)*100.0 + math.Cos(float64(i)*3.1)*50.0
@@ -104,7 +107,7 @@ func syntheticCandles(n int) []cs.Candle {
 			Close:  price + math.Sin(float64(i)*2.3)*price*0.001,
 			Volume: 10.0 + math.Abs(math.Sin(float64(i)*0.5))*5.0,
 		}
-		ts += 60_000
+		ts += 60_000_000_000 // 1 minute in ns
 	}
 	return candles
 }

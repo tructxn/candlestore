@@ -16,7 +16,7 @@ package candlestore
 import "C"
 import "unsafe"
 
-// Candle is an OHLCV bar.
+// Candle is an OHLCV bar. Ts is a unix timestamp in nanoseconds.
 type Candle struct {
 	Ts     int64
 	Open   float64
@@ -62,34 +62,66 @@ func (s *Store) Append(symbol string, c Candle) {
 	C.candlestore_append(s.ptr, sym, cc)
 }
 
+const (
+	// defaultRangeCap is the initial buffer capacity used by Range.
+	defaultRangeCap = 4096
+	// maxRangeCap bounds buffer growth (10M candles ≈ 480 MB).
+	maxRangeCap = 10_000_000
+)
+
 // Range returns candles for symbol where fromTs ≤ ts ≤ toTs.
+// The buffer grows automatically (up to maxRangeCap candles), so results
+// are never silently truncated. Use RangeN to tune the initial capacity.
 func (s *Store) Range(symbol string, fromTs, toTs int64) []Candle {
+	return s.RangeN(symbol, fromTs, toTs, defaultRangeCap)
+}
+
+// RangeN is Range with a caller-chosen initial buffer capacity of max
+// candles. If the result fills the buffer exactly (possible truncation),
+// it retries with a doubled buffer, capped at maxRangeCap candles.
+func (s *Store) RangeN(symbol string, fromTs, toTs int64, max int) []Candle {
+	if max <= 0 {
+		max = defaultRangeCap
+	}
+	if max > maxRangeCap {
+		max = maxRangeCap
+	}
+
 	sym := C.CString(symbol)
 	defer C.free(unsafe.Pointer(sym))
 
-	const maxLen = 100_000
-	buf := make([]C.CCandle, maxLen)
-	count := C.candlestore_range(
-		s.ptr, sym,
-		C.int64_t(fromTs), C.int64_t(toTs),
-		(*C.CCandle)(unsafe.Pointer(&buf[0])),
-		C.int(maxLen),
-	)
-	if count <= 0 {
-		return nil
-	}
-	out := make([]Candle, count)
-	for i := range out {
-		out[i] = Candle{
-			Ts:     int64(buf[i].ts),
-			Open:   float64(buf[i].open),
-			High:   float64(buf[i].high),
-			Low:    float64(buf[i].low),
-			Close:  float64(buf[i].close),
-			Volume: float64(buf[i].volume),
+	for {
+		buf := make([]C.CCandle, max)
+		count := int(C.candlestore_range(
+			s.ptr, sym,
+			C.int64_t(fromTs), C.int64_t(toTs),
+			(*C.CCandle)(unsafe.Pointer(&buf[0])),
+			C.int(max),
+		))
+		if count <= 0 {
+			return nil
 		}
+		if count == max && max < maxRangeCap {
+			// Buffer full — results may be truncated. Retry doubled.
+			max *= 2
+			if max > maxRangeCap {
+				max = maxRangeCap
+			}
+			continue
+		}
+		out := make([]Candle, count)
+		for i := range out {
+			out[i] = Candle{
+				Ts:     int64(buf[i].ts),
+				Open:   float64(buf[i].open),
+				High:   float64(buf[i].high),
+				Low:    float64(buf[i].low),
+				Close:  float64(buf[i].close),
+				Volume: float64(buf[i].volume),
+			}
+		}
+		return out
 	}
-	return out
 }
 
 // SymbolCount returns the number of hot symbols currently in RAM.

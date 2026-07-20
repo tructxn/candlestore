@@ -160,6 +160,47 @@ fn range_buffer_smaller_than_results_clamps_safely() {
 }
 
 #[test]
+fn range_negative_max_len_returns_minus_one_and_writes_nothing() {
+    unsafe {
+        let store = candlestore_new(4);
+        let sym = CString::new("BTC").unwrap();
+        for i in 1..=5 {
+            assert_eq!(candlestore_append(store, sym.as_ptr(), good_candle(i)), 0);
+        }
+
+        // Before the fix, max_len = -1 became usize::MAX and the full
+        // result set was written past the caller's buffer. It must be
+        // rejected up front, with the sentinel buffer left untouched.
+        let mut out: Vec<Candle> = vec![good_candle(-999); 8];
+        let rc = candlestore_range(store, sym.as_ptr(), 0, 100, out.as_mut_ptr(), -1);
+        assert_eq!(rc, -1, "negative max_len must return -1");
+        for c in &out {
+            assert_eq!(c.ts, -999, "buffer must not be written when max_len is rejected");
+        }
+
+        // max_len = 0 is a valid (if useless) request: 0 written, no error.
+        let rc = candlestore_range(store, sym.as_ptr(), 0, 100, out.as_mut_ptr(), 0);
+        assert_eq!(rc, 0, "max_len = 0 must write nothing and return 0");
+        assert_eq!(out[0].ts, -999);
+
+        candlestore_free(store);
+    }
+}
+
+#[test]
+fn new_with_nonpositive_max_symbols_returns_null_instead_of_aborting() {
+    unsafe {
+        // -1 as usize used to become usize::MAX inside CandleStore::new,
+        // panicking (→ abort across the FFI boundary). Both constructors
+        // must now reject non-positive sizes by returning null.
+        assert!(candlestore_new(-1).is_null());
+        assert!(candlestore_new(0).is_null());
+        assert!(candlestore_new_hardware(-1).is_null());
+        assert!(candlestore_new_hardware(0).is_null());
+    }
+}
+
+#[test]
 fn symbol_count_null_returns_minus_one() {
     unsafe {
         let rc = candlestore_symbol_count(ptr::null());
