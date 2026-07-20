@@ -99,21 +99,32 @@ impl BinanceFeed {
         Self { store }
     }
 
-    /// Run forever — connects, streams closed candles into the store,
-    /// and automatically reconnects on any error.
+    /// Run forever — connects, streams closed candles into the store, and
+    /// automatically reconnects after both errors and clean server closes
+    /// (Binance force-disconnects every stream after ~24 h; a graceful
+    /// close must never stop ingestion).
+    ///
+    /// There is no built-in shutdown signal: callers stop the feed by
+    /// dropping/aborting the future. The only early return is
+    /// [`FeedError::NoSubscriptions`].
     pub async fn run(&self, subs: Vec<Subscription>) -> Result<(), FeedError> {
         if subs.is_empty() { return Err(FeedError::NoSubscriptions); }
 
         loop {
             match self.stream_once(&subs).await {
-                Ok(()) => break,
-                Err(e) => {
-                    eprintln!("[candlestore] feed error: {e} — reconnecting in {}s", RECONNECT_DELAY.as_secs());
-                    tokio::time::sleep(RECONNECT_DELAY).await;
-                }
+                // Clean close from the server — treat exactly like an
+                // error: log and reconnect after the standard delay.
+                Ok(()) => eprintln!(
+                    "[candlestore] feed closed by server — reconnecting in {}s",
+                    RECONNECT_DELAY.as_secs()
+                ),
+                Err(e) => eprintln!(
+                    "[candlestore] feed error: {e} — reconnecting in {}s",
+                    RECONNECT_DELAY.as_secs()
+                ),
             }
+            tokio::time::sleep(RECONNECT_DELAY).await;
         }
-        Ok(())
     }
 
     async fn stream_once(&self, subs: &[Subscription]) -> Result<(), FeedError> {
@@ -127,14 +138,14 @@ impl BinanceFeed {
 
         while let Some(msg) = reader.next().await {
             let msg = msg?;
-            if let Message::Text(text) = msg {
-                if let Ok(combined) = serde_json::from_str::<CombinedMsg>(&text) {
-                    let k = &combined.data.k;
-                    if k.is_closed {
-                        if let Some(candle) = k.to_candle() {
-                            self.store.append(&k.store_key(), candle);
-                        }
-                    }
+            if let Message::Text(text) = msg
+                && let Ok(combined) = serde_json::from_str::<CombinedMsg>(&text)
+            {
+                let k = &combined.data.k;
+                if k.is_closed
+                    && let Some(candle) = k.to_candle()
+                {
+                    self.store.append(&k.store_key(), candle);
                 }
             }
         }

@@ -33,7 +33,12 @@ fn env_str(key: &str, default: &str) -> String {
 }
 
 fn now_nanos() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64
+    // A pre-1970 wall clock must not panic a trading binary; fall back to 0
+    // and let `next_ts` keep the sequence monotonic until the clock recovers.
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos() as i64
 }
 
 /// Returns a monotonically non-decreasing timestamp by carrying the previous
@@ -169,7 +174,15 @@ fn main() {
     let shm_cap  = env_usize("FEED_SHM_CAP", 65_536);
     let core_id  = env_usize("FEED_CORE",    0);
     let symbol   = env_str("FEED_SYMBOL",   "BTCUSDT:1m");
-    let rate     = env_usize("FEED_RATE",    10_000);
+    let rate_env = env_usize("FEED_RATE",    10_000);
+    // Clamp: FEED_RATE=0 would divide-by-zero computing `interval` below
+    // (and again in the behind-schedule check); rates above 1e9 truncate
+    // the interval to zero nanoseconds with the same effect.
+    let rate     = rate_env.clamp(1, 1_000_000_000);
+    if rate != rate_env {
+        warn!(requested = rate_env, clamped_to = rate,
+            "FEED_RATE outside [1, 1_000_000_000] — clamped");
+    }
 
     // ── pin to core ──────────────────────────────────────────────────────────
     let cores = available_cores();
@@ -188,10 +201,21 @@ fn main() {
     let writer = match ShmRingWriter::create(&shm_name, shm_cap) {
         Ok(w) => Arc::new(w),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // POSIX shm is not a file under /tmp: on Linux it appears as
+            // /dev/shm/<name>; on macOS it has no filesystem entry at all
+            // and persists until shm_unlink() or reboot. ShmRingWriter's
+            // Drop unlinks it on clean shutdown — a crash skips that.
+            let recovery_hint = if cfg!(target_os = "linux") {
+                format!("remove the stale segment with `rm /dev/shm/{}`",
+                    shm_name.trim_start_matches('/'))
+            } else {
+                "restart with a different FEED_SHM_NAME (this OS exposes no \
+                 filesystem entry for POSIX shm — a stale segment persists \
+                 until shm_unlink() or reboot)".to_owned()
+            };
             error!(%shm_name, error = %e,
                 "SHM segment already in use. If you are CERTAIN no other producer is \
-                 running (e.g. recovering from a crashed previous run), restart with \
-                 a different FEED_SHM_NAME or manually `rm /tmp/{}`.", shm_name.trim_start_matches('/'));
+                 running (e.g. recovering from a crashed previous run), {recovery_hint}.");
             std::process::exit(1);
         }
         Err(e) => {

@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use candlestore::{
     CandleStore, ShmRingReader, ShmIngester,
     Signal, Side, SpscRing, SpscWriter, SpscReader,
-    available_cores, pin_to_core, Candle,
+    available_cores, pin_to_core,
 };
 use signal_hook::consts::{SIGINT, SIGTERM};
 use tracing::{error, info, warn};
@@ -156,10 +156,44 @@ fn describe_all_metrics() {
 
 // ── SMA crossover strategy ──────────────────────────────────────────────────
 
-fn sma(candles: &[Candle], period: usize) -> Option<f64> {
-    if candles.len() < period { return None; }
-    let slice = &candles[candles.len() - period..];
-    Some(slice.iter().map(|c| c.close).sum::<f64>() / period as f64)
+/// O(1) incremental SMA over the last `period` closes.
+///
+/// Fixed ring of closes + rolling sum: each new close replaces the oldest
+/// and adjusts the sum, so the strategy's per-candle cost is two f64 ops
+/// instead of an O(period) re-sum over a freshly allocated `last_n` window.
+/// `value()` is `None` until `period` closes have been seen (warm-up).
+struct RollingSma {
+    period: usize,
+    buf:    Vec<f64>,
+    next:   usize,
+    filled: usize,
+    sum:    f64,
+}
+
+impl RollingSma {
+    fn new(period: usize) -> Self {
+        Self { period, buf: vec![0.0; period], next: 0, filled: 0, sum: 0.0 }
+    }
+
+    fn push(&mut self, close: f64) {
+        if self.period == 0 { return; }
+        if self.filled == self.period {
+            self.sum -= self.buf[self.next];
+        } else {
+            self.filled += 1;
+        }
+        self.sum += close;
+        self.buf[self.next] = close;
+        self.next = (self.next + 1) % self.period;
+    }
+
+    fn value(&self) -> Option<f64> {
+        if self.period > 0 && self.filled == self.period {
+            Some(self.sum / self.period as f64)
+        } else {
+            None
+        }
+    }
 }
 
 // The strategy thread is a process-boundary entry. Each parameter is a
@@ -182,6 +216,10 @@ fn strategy_thread(
     info!(core = core_id, affinity_set = ok, %symbol, short_p, long_p, "strategy thread started");
 
     let min_candles = long_p + 1;
+    let mut short_sma = RollingSma::new(short_p);
+    let mut long_sma  = RollingSma::new(long_p);
+    let mut candles_seen: usize = 0;
+    let mut last_candle_ts: i64 = i64::MIN;
     let mut prev_short: Option<f64> = None;
     let mut prev_long:  Option<f64> = None;
     let mut signal_count = 0u64;
@@ -200,11 +238,31 @@ fn strategy_thread(
             return;
         }
 
-        let candles = store.last_n(&symbol, min_candles);
-        if candles.len() < min_candles { continue; }
+        // One small fetch per wakeup. During warm-up we pull the full window
+        // so a restart against an already-hot store seeds instantly; once
+        // warm, only the newest candle is fetched and folded into the O(1)
+        // rolling state — no per-tick window allocation or O(period) re-sum.
+        if candles_seen < min_candles {
+            for c in store.last_n(&symbol, min_candles) {
+                if c.ts > last_candle_ts {
+                    short_sma.push(c.close);
+                    long_sma.push(c.close);
+                    candles_seen += 1;
+                    last_candle_ts = c.ts;
+                }
+            }
+            if candles_seen < min_candles { continue; }
+        } else {
+            let Some(c) = store.last_n(&symbol, 1).pop() else { continue };
+            if c.ts <= last_candle_ts { continue; } // spurious wake — no new candle
+            short_sma.push(c.close);
+            long_sma.push(c.close);
+            candles_seen += 1;
+            last_candle_ts = c.ts;
+        }
 
-        let curr_short = sma(&candles, short_p);
-        let curr_long  = sma(&candles, long_p);
+        let curr_short = short_sma.value();
+        let curr_long  = long_sma.value();
 
         if let (Some(ps), Some(pl), Some(cs), Some(cl)) =
             (prev_short, prev_long, curr_short, curr_long)
@@ -219,10 +277,32 @@ fn strategy_thread(
 
             if let Some(side) = side {
                 use std::time::{SystemTime, UNIX_EPOCH};
+                // A pre-1970 wall clock must not panic the hot path.
                 let ts = SystemTime::now()
-                    .duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64;
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or(Duration::ZERO)
+                    .as_nanos() as i64;
                 let sig = Signal::new(ts, &symbol, side, qty, 0.0, 1);
-                sig_tx.push(sig);
+
+                // Bounded push (mirrors feed_handler's push-until-shutdown
+                // pattern): blocking inside `SpscWriter::push` when the
+                // executor died and the ring filled would wedge this thread
+                // where the shutdown flag is never checked, forcing main's
+                // 5 s join timeout. On shutdown-while-pushing, drop the
+                // signal and exit cleanly.
+                let mut delivered = true;
+                while !sig_tx.try_push(sig) {
+                    if shutdown.load(Ordering::Relaxed) {
+                        delivered = false;
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                if !delivered {
+                    info!(signals = signal_count,
+                        "shutdown while pushing signal — dropped it, strategy thread exiting");
+                    return;
+                }
                 signal_count += 1;
                 signals_counter.store(signal_count, Ordering::Relaxed);
 
@@ -857,6 +937,58 @@ mod tests {
         // Overwrite with a different value — atomicity smoke test.
         persist_position(&path, -3.5).unwrap();
         assert_eq!(load_position(&path), -3.5);
+    }
+
+    // ── incremental SMA (strategy hot path) ────────────────────────────────
+
+    #[test]
+    fn rolling_sma_matches_naive_recompute() {
+        let period = 7usize;
+        let mut state = RollingSma::new(period);
+        let mut closes: Vec<f64> = Vec::new();
+        // Deterministic LCG "random walk" — no rand dependency needed.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..1_000 {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005)
+                       .wrapping_add(1_442_695_040_888_963_407);
+            let close = 50_000.0 + (seed >> 33) as f64 / 1e4;
+            closes.push(close);
+            state.push(close);
+
+            let naive = if closes.len() >= period {
+                Some(closes[closes.len() - period..].iter().sum::<f64>() / period as f64)
+            } else {
+                None
+            };
+            match (state.value(), naive) {
+                (Some(a), Some(b)) => assert!(
+                    (a - b).abs() < 1e-6,
+                    "incremental {a} diverged from naive {b}"
+                ),
+                (None, None) => {} // both still warming up
+                (a, b) => panic!("warm-up gating mismatch: incremental {a:?}, naive {b:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rolling_sma_warms_up_after_exactly_period_closes() {
+        let mut s = RollingSma::new(3);
+        s.push(1.0);
+        assert_eq!(s.value(), None);
+        s.push(2.0);
+        assert_eq!(s.value(), None);
+        s.push(3.0);
+        assert_eq!(s.value(), Some(2.0));
+        s.push(4.0); // window slides: (2 + 3 + 4) / 3
+        assert_eq!(s.value(), Some(3.0));
+    }
+
+    #[test]
+    fn rolling_sma_zero_period_never_panics_or_produces_a_value() {
+        let mut s = RollingSma::new(0);
+        s.push(1.0); // must not panic (old naive sma yielded NaN → no signals)
+        assert_eq!(s.value(), None);
     }
 
     #[test]
